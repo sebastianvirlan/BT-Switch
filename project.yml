@@ -1,0 +1,42 @@
+name: BTSwitch
+
+options:
+  bundleIdPrefix: com.user
+  deploymentTarget:
+    macOS: "13.0"
+  developmentLanguage: en
+
+settings:
+  base:
+    PRODUCT_NAME: BTSwitch
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    # Ad-hoc signing is enough to get the app running locally with the
+    # Bluetooth entitlement. For distribution you'd switch to a Developer ID.
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+
+targets:
+  BTSwitch:
+    type: application
+    platform: macOS
+    sources:
+      - path: BTSwitch
+        excludes:
+          - "Info.plist"
+          - "BTSwitch.entitlements"
+    info:
+      path: BTSwitch/Info.plist
+    entitlements:
+      path: BTSwitch/BTSwitch.entitlements
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.user.btswitch
+        INFOPLIST_FILE: BTSwitch/Info.plist
+        CODE_SIGN_ENTITLEMENTS: BTSwitch/BTSwitch.entitlements
+        # Don't try to generate Info.plist from build settings; we provide it.
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - sdk: IOBluetooth.framework
