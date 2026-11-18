@@ -20,12 +20,15 @@ final class BTServices {
     let pairingController: PairingController
     let coordinator: SwitchCoordinator
     let server: NetworkServer
+    let power: PowerMonitor
 
     private init() {
         let logger = AppLogger.shared
         let bt = BluetoothController()
         // Shared so a local switch and an incoming CONNECT never overlap.
         let lock = SwitchLock()
+        let power = PowerMonitor(logger: logger)
+        self.power = power
         self.bluetooth = bt
         self.directory = PeerDirectory(logger: logger)
         self.pairingController = PairingController(store: PairingStore.shared, logger: logger)
@@ -35,14 +38,16 @@ final class BTServices {
             directory: directory,
             bluetooth: bt,
             logger: logger,
-            switchLock: lock
+            switchLock: lock,
+            power: power
         )
         self.server = NetworkServer(
             settings: AppSettings.shared,
             bluetooth: bt,
             logger: logger,
             switchLock: lock,
-            pairing: PairingStore.shared
+            pairing: PairingStore.shared,
+            power: power
         )
     }
 }
@@ -63,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         services.server.requestApproval = { request, decide in
             PairingPrompt.show(request, decide: decide)
         }
+        services.power.start()
         services.server.start()
         services.directory.start()
 

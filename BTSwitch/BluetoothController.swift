@@ -74,6 +74,11 @@ final class BluetoothController {
         }
     }
 
+    func isPoweredOn() -> Bool {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return queue.sync { Self.isPoweredOn }
+    }
+
     func isConnected(_ mac: String) -> Bool {
         dispatchPrecondition(condition: .notOnQueue(queue))
         return queue.sync { Self.device(mac)?.isConnected() ?? false }

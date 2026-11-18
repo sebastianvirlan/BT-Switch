@@ -33,6 +33,7 @@ final class NetworkServer: ObservableObject {
     private let logger: AppLogger
     private let switchLock: SwitchLock
     private let pairing: PairingStore
+    private let power: PowerMonitor
     private let replayGuard = ReplayGuard()
     private var listener: NWListener?
     /// Connection handling, including all pairing state, runs on this queue.
@@ -41,14 +42,18 @@ final class NetworkServer: ObservableObject {
     private var pairingInProgress = false   // acceptQueue only
 
     static let approvalTimeout: TimeInterval = 60
+    /// A CONNECT still running after this long is abandoned; the other Mac
+    /// gives up on it soon after.
+    static let connectBudget: TimeInterval = 75
 
     init(settings: AppSettings, bluetooth: BluetoothController, logger: AppLogger,
-         switchLock: SwitchLock, pairing: PairingStore) {
+         switchLock: SwitchLock, pairing: PairingStore, power: PowerMonitor) {
         self.settings = settings
         self.bluetooth = bluetooth
         self.logger = logger
         self.switchLock = switchLock
         self.pairing = pairing
+        self.power = power
     }
 
     func start() {
@@ -301,7 +306,24 @@ final class NetworkServer: ObservableObject {
                 reply("ERR busy")
             } else {
                 logger.info("ping from \(peerName)")
-                reply(PingReply(instanceID: AppInfo.instanceID, name: AppInfo.computerName).encoded)
+                // Peripherals are probably about to arrive: turn the screen
+                // on, which also turns a dark wake into a full one, and
+                // only say we're ready once that has happened.
+                workQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    self.power.declareUserActivity("BTSwitch: \(peerName) is switching peripherals here")
+                    let readiness: PingReply.Readiness
+                    if !self.bluetooth.isPoweredOn() {
+                        readiness = .bluetoothOff
+                    } else if self.power.waitUntilAwake(timeout: 4) {
+                        readiness = .ready
+                    } else {
+                        readiness = .waking
+                        self.logger.warn("not fully awake yet; told \(peerName) to wait")
+                    }
+                    reply(PingReply(instanceID: AppInfo.instanceID, name: AppInfo.computerName,
+                                    readiness: readiness).encoded)
+                }
             }
 
         case "UNPAIR":
@@ -348,10 +370,16 @@ final class NetworkServer: ObservableObject {
                     logger.info("using the same \(macs.count) peripheral(s) as \(peerName) for switching back")
                 }
             }
+            power.declareUserActivity("BTSwitch: connecting peripherals from \(peerName)")
+            let allowSleep = power.preventSleep("BTSwitch: connecting peripherals from \(peerName)")
+            let job = ConnectJob(epoch: power.sleepEpoch, started: Date())
             workQueue.async { [weak self] in
                 guard let self = self else { return }
-                defer { self.switchLock.release() }
-                reply(self.handleConnect(macs: macs))
+                defer {
+                    allowSleep()
+                    self.switchLock.release()
+                }
+                reply(self.handleConnect(macs: macs, job: job))
             }
 
         case let s where s.hasPrefix("RELEASE "):
@@ -476,10 +504,26 @@ final class NetworkServer: ObservableObject {
 
     // MARK: - Commands
 
+    /// One incoming CONNECT. Stale once the Mac has started sleeping since
+    /// it arrived, or once it has run longer than the other Mac will wait;
+    /// by then the other Mac has rolled back, and finishing would take the
+    /// peripherals away from it.
+    private struct ConnectJob {
+        let epoch: Int
+        let started: Date
+    }
+
+    private func staleReason(_ job: ConnectJob) -> String? {
+        if power.sleepEpoch != job.epoch { return "this Mac went to sleep part way through" }
+        if Date().timeIntervalSince(job.started) > Self.connectBudget { return "took too long" }
+        return nil
+    }
+
     /// Connects the peripherals here and returns the reply line.
-    private func handleConnect(macs: [String]) -> String {
+    private func handleConnect(macs: [String], job: ConnectJob) -> String {
         var reports: [PeripheralReport] = []
         for mac in macs {
+            if staleReason(job) != nil { break }
             if bluetooth.isReady(mac) {
                 logger.info("  \(mac): already connected")
                 reports.append(PeripheralReport(mac: mac, status: "already_connected"))
@@ -488,6 +532,7 @@ final class NetworkServer: ObservableObject {
             var lastErr: BluetoothController.ConnectError?
             var connectedOnAttempt: Int?
             for attempt in 1...3 {
+                if staleReason(job) != nil { break }
                 switch bluetooth.connect(mac) {
                 case .success:
                     logger.info("  \(mac): connected (attempt \(attempt))")
@@ -506,19 +551,35 @@ final class NetworkServer: ObservableObject {
                                                 error: lastErr.map { "\($0)" } ?? "unknown"))
             }
         }
-        return PeripheralReport.encodeOK(settle(reports))
+        if staleReason(job) == nil { reports = settle(reports, job: job) }
+        if let why = staleReason(job) { return abandon(macs: macs, reports: reports, because: why) }
+        return PeripheralReport.encodeOK(reports)
+    }
+
+    /// Hands back anything this request connected, so the other Mac can
+    /// take its peripherals back, and reports everything as failed.
+    private func abandon(macs: [String], reports: [PeripheralReport], because why: String) -> String {
+        logger.warn("abandoning connect: \(why)")
+        for r in reports where r.status == "connected" {
+            logger.info("  release \(r.mac): \(bluetooth.remove(r.mac))")
+        }
+        let failed = macs.map { mac -> PeripheralReport in
+            if let r = reports.first(where: { $0.mac == mac }), r.status == "already_connected" { return r }
+            return PeripheralReport(mac: mac, status: "failed", error: why)
+        }
+        return PeripheralReport.encodeOK(failed)
     }
 
     /// Some peripherals (notably the Magic Mouse) occasionally report
     /// connected and drop a moment later. Re-check after a short pause and
     /// retry any that fell off before answering.
-    private func settle(_ reports: [PeripheralReport]) -> [PeripheralReport] {
+    private func settle(_ reports: [PeripheralReport], job: ConnectJob) -> [PeripheralReport] {
         guard reports.contains(where: \.isConnected) else { return reports }
         Thread.sleep(forTimeInterval: 1.5)
         return reports.map { report in
             guard report.isConnected, !bluetooth.isReady(report.mac) else { return report }
             logger.warn("  \(report.mac): dropped or didn't finish pairing; retrying")
-            for attempt in 1...2 {
+            for attempt in 1...2 where staleReason(job) == nil {
                 if case .success = bluetooth.connect(report.mac) {
                     Thread.sleep(forTimeInterval: 1)
                     if bluetooth.isReady(report.mac) {

@@ -40,3 +40,4 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
     dependencies:
       - sdk: IOBluetooth.framework
+      - sdk: IOKit.framework

@@ -21,6 +21,7 @@ BTSwitch uses the same Bluetooth approach as Blue Switch (`IOBluetoothDevicePair
 - All IOBluetooth work runs on one dedicated background queue, so pairing callbacks aren't blocked by `openConnection` (without this, pairing hangs after `devicePairingStarted`) and the framework is never used from two threads at once.
 - A hard RSSI check fails fast on sleeping peripherals instead of timing out after 10–20 seconds.
 - It pings the destination *before* removing peripherals locally, so a network failure can't leave you with no working keyboard.
+- A sleeping destination is woken fully before anything moves, and kept awake while it connects (see [The other Mac was asleep](#the-other-mac-was-asleep)).
 - If a peripheral doesn't arrive on the destination, BTSwitch reconnects it to the source Mac.
 - Only one switch runs at a time. If both Macs are clicked at once, both back off instead of fighting over the peripherals.
 - Connection attempts are retried up to 3 times, and `isConnected` is polled briefly afterwards because it can lag.
@@ -199,6 +200,18 @@ If a peripheral keeps dropping, restart Bluetooth on both Macs:
 ```bash
 sudo pkill bluetoothd    # auto-respawns
 ```
+
+### The other Mac was asleep
+
+A sleeping Mac can be woken briefly by network traffic (a "dark wake", via Wake for network access or a Bonjour sleep proxy such as an Apple TV or HomePod). It answers on the network with the screen off, then falls asleep again seconds later, often in the middle of pairing. BTSwitch guards against this:
+
+1. The ping wakes the destination fully (as if someone pressed a key, so its screen turns on). BTSwitch removes nothing locally until the destination says it's fully awake, waiting up to 15 seconds. Otherwise you get "… is asleep and didn't wake up fully; nothing was moved".
+2. The destination keeps itself from idle-sleeping while it connects the peripherals.
+3. While waiting for the destination, the source checks in every few seconds. If the destination stops answering, the source stops waiting and takes the peripherals back right away instead of sitting out the timeout.
+4. The source keeps trying to reconnect the peripherals for up to 20 seconds, not just once.
+5. If the destination was interrupted by sleep, or ran past its time limit, it releases anything it connected, so it can't take the peripherals after the source has given up.
+
+If it still happens, the destination's log shows "this Mac is going to sleep" during the switch.
 
 ### Logs
 

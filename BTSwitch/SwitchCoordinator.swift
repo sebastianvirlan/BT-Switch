@@ -24,16 +24,18 @@ final class SwitchCoordinator: ObservableObject {
     private let bluetooth: BluetoothController
     private let logger: AppLogger
     private let switchLock: SwitchLock
+    private let power: PowerMonitor
     private let workQueue = DispatchQueue(label: "\(AppInfo.bundleID).coordinator", qos: .userInitiated)
 
     init(settings: AppSettings, pairing: PairingStore, directory: PeerDirectory,
-         bluetooth: BluetoothController, logger: AppLogger, switchLock: SwitchLock) {
+         bluetooth: BluetoothController, logger: AppLogger, switchLock: SwitchLock, power: PowerMonitor) {
         self.settings = settings
         self.pairing = pairing
         self.directory = directory
         self.bluetooth = bluetooth
         self.logger = logger
         self.switchLock = switchLock
+        self.power = power
     }
 
     /// Resolves how to reach the paired Mac. Call on main.
@@ -53,12 +55,17 @@ final class SwitchCoordinator: ObservableObject {
         case .success(let x): t = x
         }
         DispatchQueue.global(qos: .userInitiated).async {
-            let r = NetworkClient.send(to: t, command: "PING", timeout: 5)
+            let r = NetworkClient.send(to: t, command: "PING", timeout: 8)
             let (ok, msg): (Bool, String)
             switch r {
             case .success(let s):
                 if let pong = PingReply(s) {
-                    (ok, msg) = (true, "\(pong.name ?? t.label) is reachable and paired")
+                    let who = pong.name ?? t.label
+                    switch pong.readiness {
+                    case .bluetoothOff?: (ok, msg) = (false, "\(who) is reachable and paired, but its Bluetooth is off")
+                    case .waking?: (ok, msg) = (true, "\(who) is reachable and paired (it's still waking up)")
+                    default: (ok, msg) = (true, "\(who) is reachable and paired")
+                    }
                 } else if BTProtocol.errorCode(in: s) == "busy" {
                     (ok, msg) = (true, "\(t.label) is reachable and paired (it's busy right now)")
                 } else {
@@ -123,9 +130,13 @@ final class SwitchCoordinator: ObservableObject {
         setStatus(.running("pinging \(dest)…"))
         logger.info("switch start: dest=\(dest) macs=\(macs)")
 
+        let allowSleep = power.preventSleep("BTSwitch: moving peripherals to \(dest)")
         workQueue.async { [weak self] in
             guard let self = self else { return }
-            defer { self.switchLock.release() }
+            defer {
+                allowSleep()
+                self.switchLock.release()
+            }
             let succeeded = self.runSwitch(target: t, macs: macs, names: names)
             if succeeded, let text = clipboard {
                 self.sendClipboard(text, to: t)
@@ -142,21 +153,47 @@ final class SwitchCoordinator: ObservableObject {
         func send(_ command: String, timeout: TimeInterval) -> Result<String, NetworkFailure> {
             NetworkClient.send(to: target, command: command, timeout: timeout)
         }
+        func sendWatched(_ command: String, timeout: TimeInterval) -> Result<String, WatchedFailure> {
+            self.sendWatched(command, to: target, timeout: timeout)
+        }
         let macList = macs.joined(separator: ",")
 
         // 1. Ping the destination BEFORE removing anything locally, so an
         //    unreachable/misconfigured/busy destination can't strand the
-        //    peripherals.
-        switch send("PING", timeout: 5) {
-        case .failure(let e):
-            logger.error("ping failed: \(e)")
-            fail("\(e)"); return false
-        case .success(let resp):
-            guard let pong = PingReply(resp) else {
-                logger.error("ping rejected: \(resp)")
-                fail(BTProtocol.describe(response: resp)); return false
+        //    peripherals. A sleeping Mac can answer from a dark wake and
+        //    fall asleep again mid-pairing, so wait until it says it's
+        //    fully awake. The ping itself wakes it up.
+        let wakeDeadline = Date().addingTimeInterval(Self.wakeWait)
+        while true {
+            switch send("PING", timeout: 8) {
+            case .failure(let e):
+                logger.error("ping failed: \(e)")
+                fail("\(e)"); return false
+            case .success(let resp):
+                guard let pong = PingReply(resp) else {
+                    logger.error("ping rejected: \(resp)")
+                    fail(BTProtocol.describe(response: resp)); return false
+                }
+                let who = pong.name ?? dest
+                switch pong.readiness {
+                case .bluetoothOff?:
+                    logger.error("\(who) has Bluetooth turned off")
+                    fail("Bluetooth is off on \(who); nothing was moved"); return false
+                case .waking?:
+                    guard Date() < wakeDeadline else {
+                        logger.error("\(who) didn't wake up fully")
+                        fail("\(who) is asleep and didn't wake up fully; nothing was moved. Wake it and try again")
+                        return false
+                    }
+                    logger.info("\(who) is waking up; waiting")
+                    setStatus(.running("waking \(who)…"))
+                    Thread.sleep(forTimeInterval: 1)
+                    continue
+                case .ready?, nil:
+                    logger.info("ping ok: \(who)")
+                }
             }
-            logger.info("ping ok: \(pong.name ?? dest)")
+            break
         }
 
         // 2. Remove peripherals locally.
@@ -175,8 +212,13 @@ final class SwitchCoordinator: ObservableObject {
         setStatus(.running("connecting on \(dest)…"))
         var connectReports: [PeripheralReport]?
         var connectProblem: String?
-        switch send("CONNECT \(macList)", timeout: 90) {
-        case .failure(let e):
+        var destWentQuiet = false
+        switch sendWatched("CONNECT \(macList)", timeout: 90) {
+        case .failure(.stoppedAnswering):
+            logger.error("\(dest) stopped answering during CONNECT (asleep?)")
+            connectProblem = "\(dest) stopped answering (did it go to sleep?)"
+            destWentQuiet = true
+        case .failure(.request(let e)):
             logger.error("CONNECT failed: \(e)")
             connectProblem = "connect on destination failed: \(e)"
         case .success(let resp):
@@ -206,7 +248,7 @@ final class SwitchCoordinator: ObservableObject {
         }
         // Fall back to what CONNECT reported. If we know nothing, assume
         // nothing arrived.
-        var arrived = verify(macs, timeout: connectProblem == nil ? 10 : 30)
+        var arrived = (destWentQuiet ? nil : verify(macs, timeout: connectProblem == nil ? 10 : 30))
             ?? Set((connectReports ?? []).filter(\.isConnected).map(\.mac))
         var missing = macs.filter { !arrived.contains($0) }
 
@@ -215,11 +257,14 @@ final class SwitchCoordinator: ObservableObject {
         if !missing.isEmpty, connectReports != nil {
             logger.warn("not on \(dest) yet: \(label(missing)); asking it to try again")
             setStatus(.running("retrying \(label(missing)) on \(dest)…"))
-            switch send("CONNECT \(missing.joined(separator: ","))", timeout: 60) {
+            switch sendWatched("CONNECT \(missing.joined(separator: ","))", timeout: 60) {
             case .success(let resp): logger.info("retry CONNECT response: \(resp)")
-            case .failure(let e): logger.warn("retry CONNECT failed: \(e)")
+            case .failure(.stoppedAnswering):
+                logger.error("\(dest) stopped answering during the retry (asleep?)")
+                destWentQuiet = true
+            case .failure(.request(let e)): logger.warn("retry CONNECT failed: \(e)")
             }
-            if let now = verify(macs, timeout: 10) { arrived = now }
+            if !destWentQuiet, let now = verify(macs, timeout: 10) { arrived = now }
             missing = macs.filter { !arrived.contains($0) }
         }
 
@@ -234,25 +279,40 @@ final class SwitchCoordinator: ObservableObject {
         //    got and bring everything back here.
         let reason = connectProblem ?? "\(label(missing)) didn't connect on \(dest)"
         logger.warn("\(reason); bringing all peripherals back to this Mac")
-        let toRelease = macs.filter { arrived.contains($0) }
+        // If it went quiet we don't know what it got, so ask it to release
+        // everything; if it's asleep, it drops stale work when it wakes.
+        let toRelease = destWentQuiet ? macs : macs.filter { arrived.contains($0) }
         if !toRelease.isEmpty {
             setStatus(.running("taking peripherals back from \(dest)…"))
-            switch send("RELEASE \(toRelease.joined(separator: ","))", timeout: 20) {
+            switch send("RELEASE \(toRelease.joined(separator: ","))", timeout: destWentQuiet ? 5 : 20) {
             case .success(let resp): logger.info("RELEASE response: \(resp)")
             case .failure(let e): logger.warn("couldn't ask \(dest) to release \(label(toRelease)): \(e)")
             }
         }
 
+        // The peripherals may still be busy with the other Mac or dozing,
+        // so keep trying for a while rather than once.
         setStatus(.running("reconnecting here…"))
-        var stranded: [String] = []
-        for mac in macs where !bluetooth.isReady(mac) {
-            switch bluetooth.connect(mac) {
-            case .success:
-                logger.info("  \(names[mac] ?? mac): reconnected here")
-            case .failure(let e):
-                logger.error("  \(names[mac] ?? mac): couldn't reconnect here - \(e)")
-                stranded.append(mac)
+        var stranded = macs.filter { !bluetooth.isReady($0) }
+        let reconnectDeadline = Date().addingTimeInterval(Self.reconnectWait)
+        var round = 0
+        while !stranded.isEmpty {
+            round += 1
+            stranded = stranded.filter { mac in
+                switch bluetooth.connect(mac) {
+                case .success:
+                    logger.info("  \(names[mac] ?? mac): reconnected here")
+                    return false
+                case .failure(let e):
+                    logger.warn("  \(names[mac] ?? mac): couldn't reconnect here (try \(round)) - \(e)")
+                    return true
+                }
             }
+            if stranded.isEmpty || Date() >= reconnectDeadline { break }
+            Thread.sleep(forTimeInterval: 2)
+        }
+        for mac in stranded {
+            logger.error("  \(names[mac] ?? mac): gave up reconnecting here")
         }
 
         if stranded.isEmpty {
@@ -261,6 +321,41 @@ final class SwitchCoordinator: ObservableObject {
             fail("\(reason); couldn't reconnect \(label(stranded)) here. Wake it and click the icon again, or pair it in System Settings")
         }
         return false
+    }
+
+    /// How long to wait for a sleeping destination to wake fully.
+    static let wakeWait: TimeInterval = 15
+    /// How long to keep trying to take peripherals back after a failure.
+    static let reconnectWait: TimeInterval = 20
+
+    enum WatchedFailure: Error {
+        case request(NetworkFailure)
+        /// The destination stopped answering pings while the request ran.
+        case stoppedAnswering
+    }
+
+    /// Sends a long-running request while pinging the destination every few
+    /// seconds. A busy destination still answers ("ERR busy"); one that has
+    /// gone to sleep doesn't, and then we stop waiting instead of sitting
+    /// out the full timeout with no keyboard or mouse.
+    private func sendWatched(_ command: String, to target: PeerTarget, timeout: TimeInterval) -> Result<String, WatchedFailure> {
+        let done = DispatchSemaphore(value: 0)
+        var result: Result<String, NetworkFailure>?
+        DispatchQueue.global(qos: .userInitiated).async {
+            result = NetworkClient.send(to: target, command: command, timeout: timeout)
+            done.signal()
+        }
+        var missed = 0
+        while done.wait(timeout: .now() + 5) == .timedOut {
+            if case .failure = NetworkClient.send(to: target, command: "PING", timeout: 4) {
+                missed += 1
+                logger.warn("\(target.label) didn't answer a check-in (\(missed))")
+                if missed >= 2 { return .failure(.stoppedAnswering) }
+            } else {
+                missed = 0
+            }
+        }
+        return (result ?? .failure(.other("no result"))).mapError { .request($0) }
     }
 
     /// Sends clipboard text after a successful switch. Failures are logged

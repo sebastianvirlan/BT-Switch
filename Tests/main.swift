@@ -431,6 +431,20 @@ test("ping reply accepts bare pong, rejects others") {
     check(PingReply("ERR busy") == nil, "error")
 }
 
+test("ping reply carries readiness") {
+    let r = PingReply(instanceID: "abc123def456", name: "Studio", readiness: .waking)
+    check(r.encoded == "OK pong abc123def456 state=waking Studio", "got \(r.encoded)")
+    let parsed = PingReply(r.encoded)
+    check(parsed?.readiness == .waking, "readiness")
+    check(parsed?.name == "Studio", "name after state")
+    check(parsed?.instanceID == "abc123def456", "id")
+    check(PingReply("OK pong abc state=bluetooth_off Mac mini")?.readiness == .bluetoothOff, "bluetooth off")
+    check(PingReply("OK pong abc state=ready")?.name == nil, "state without name")
+    check(PingReply("OK pong abc Studio Mac")?.readiness == nil, "older build: no state")
+    check(PingReply("OK pong abc state=bogus Studio")?.readiness == nil, "unknown state ignored")
+    check(PingReply("OK pong abc state=bogus Studio")?.name == "Studio", "unknown state not part of name")
+}
+
 // MARK: Network failures
 
 test("socket errors map to user-facing causes") {

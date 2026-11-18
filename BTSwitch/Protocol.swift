@@ -484,27 +484,60 @@ struct ErrorReply: Equatable {
 /// "OK pong [<instance_id> <computer name>]". The identity confirms which
 /// machine answered. A bare "OK pong" is accepted too.
 struct PingReply: Equatable {
+    /// Whether the Mac can take peripherals right now.
+    enum Readiness: String {
+        case ready
+        /// Answering from a dark wake (or about to sleep); not safe yet.
+        case waking
+        case bluetoothOff = "bluetooth_off"
+    }
+
     let instanceID: String?
     let name: String?
+    /// nil from builds that predate the field; treat as ready.
+    let readiness: Readiness?
 
-    init(instanceID: String, name: String) {
+    init(instanceID: String, name: String, readiness: Readiness? = nil) {
         self.instanceID = instanceID
         self.name = name
+        self.readiness = readiness
     }
 
     init?(_ response: String) {
         guard response == "OK pong" || response.hasPrefix("OK pong ") else { return nil }
-        let rest = response.dropFirst("OK pong".count).trimmingCharacters(in: .whitespaces)
-        let parts = rest.split(separator: " ", maxSplits: 1)
-        instanceID = parts.first.map(String.init)
-        name = parts.count > 1 ? String(parts[1]) : nil
+        var rest = Substring(response.dropFirst("OK pong".count).trimmingCharacters(in: .whitespaces))
+        func token() -> Substring? {
+            guard !rest.isEmpty else { return nil }
+            let t = rest.prefix { $0 != " " }
+            return t
+        }
+        func consume(_ t: Substring) {
+            rest = rest.dropFirst(t.count).drop { $0 == " " }
+        }
+        if let t = token() {
+            instanceID = String(t)
+            consume(t)
+        } else {
+            instanceID = nil
+        }
+        // "state=<readiness>" sits between the id and the name.
+        if let t = token(), t.hasPrefix("state=") {
+            readiness = Readiness(rawValue: String(t.dropFirst("state=".count)))
+            consume(t)
+        } else {
+            readiness = nil
+        }
+        name = rest.isEmpty ? nil : String(rest)
     }
 
     var encoded: String {
         guard let id = instanceID else { return "OK pong" }
+        var parts = ["OK pong", id]
+        if let r = readiness { parts.append("state=\(r.rawValue)") }
         // Keep it on one line whatever the computer is called.
         let n = (name ?? "").components(separatedBy: .newlines).joined(separator: " ")
-        return n.isEmpty ? "OK pong \(id)" : "OK pong \(id) \(n)"
+        if !n.isEmpty { parts.append(n) }
+        return parts.joined(separator: " ")
     }
 }
 

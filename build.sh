@@ -45,6 +45,7 @@ xcrun swiftc \
     -framework Network \
     -framework CryptoKit \
     -framework SystemConfiguration \
+    -framework IOKit \
     -O \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     $SWIFT_FILES
