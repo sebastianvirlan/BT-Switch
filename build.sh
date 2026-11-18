@@ -44,6 +44,7 @@ xcrun swiftc \
     -framework Combine \
     -framework Network \
     -framework CryptoKit \
+    -framework SystemConfiguration \
     -O \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     $SWIFT_FILES
@@ -54,6 +55,9 @@ cp "$SOURCES_DIR/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
 sed -i '' "s/\$(EXECUTABLE_NAME)/$APP_NAME/g" "$APP_BUNDLE/Contents/Info.plist"
 sed -i '' "s/\$(PRODUCT_BUNDLE_IDENTIFIER)/$BUNDLE_ID/g" "$APP_BUNDLE/Contents/Info.plist"
 sed -i '' "s/\$(PRODUCT_NAME)/$APP_NAME/g" "$APP_BUNDLE/Contents/Info.plist"
+
+echo "==> Copying app icon…"
+cp "$SOURCES_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 echo "==> Ad-hoc code signing with entitlements…"
 codesign --force --sign - \

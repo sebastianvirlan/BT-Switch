@@ -65,7 +65,7 @@ final class SwitchCoordinator: ObservableObject {
     }
 
     private func runSwitch(dest: String, port: Int, macs: [String], token: String) {
-        func send(_ command: String, timeout: TimeInterval) -> Result<String, NetworkClient.Failure> {
+        func send(_ command: String, timeout: TimeInterval) -> Result<String, NetworkFailure> {
             NetworkClient.send(host: dest, port: port, command: command, token: token, timeout: timeout)
         }
         let macList = macs.joined(separator: ",")
@@ -76,12 +76,17 @@ final class SwitchCoordinator: ObservableObject {
         switch send("PING", timeout: 5) {
         case .failure(let e):
             logger.error("ping failed: \(e)")
-            return fail("can't reach \(dest): \(e)")
-        case .success(let resp) where resp == "OK pong":
-            logger.info("ping ok")
+            return fail("\(e)")
         case .success(let resp):
-            logger.error("ping unexpected response: \(resp)")
-            return fail(Self.describe(response: resp))
+            guard let pong = PingReply(resp) else {
+                logger.error("ping rejected: \(resp)")
+                return fail(BTProtocol.describe(response: resp, localToken: token))
+            }
+            if pong.instanceID == AppInfo.instanceID {
+                logger.error("destination \(dest) is this Mac")
+                return fail("\(dest) is this Mac; enter the other Mac's address in Settings")
+            }
+            logger.info("ping ok: \(pong.name ?? dest)")
         }
 
         // 2. Remove peripherals locally.
@@ -109,7 +114,7 @@ final class SwitchCoordinator: ObservableObject {
             if let reports = PeripheralReport.decodeOK(resp) {
                 connectReports = reports
             } else {
-                connectProblem = Self.describe(response: resp)
+                connectProblem = BTProtocol.describe(response: resp, localToken: token)
             }
         }
 
@@ -159,13 +164,6 @@ final class SwitchCoordinator: ObservableObject {
         } else {
             fail("\(reason); could not reconnect \(stranded.joined(separator: ", ")) here — wake it and pair via System Settings")
         }
-    }
-
-    private static func describe(response: String) -> String {
-        if let code = BTProtocol.errorCode(in: response) {
-            return BTProtocol.describe(errorCode: code)
-        }
-        return "unexpected response: \(response)"
     }
 
     private func fail(_ msg: String) {

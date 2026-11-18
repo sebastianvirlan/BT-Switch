@@ -5,6 +5,7 @@ import Combine
 final class MenuBarController: NSObject {
     private let settings: AppSettings
     private let coordinator: SwitchCoordinator
+    private let server: NetworkServer
     private let bluetooth: BluetoothController
     private let logger: AppLogger
     private let openSettings: () -> Void
@@ -21,11 +22,13 @@ final class MenuBarController: NSObject {
 
     init(settings: AppSettings,
          coordinator: SwitchCoordinator,
+         server: NetworkServer,
          bluetooth: BluetoothController,
          logger: AppLogger,
          openSettings: @escaping () -> Void) {
         self.settings = settings
         self.coordinator = coordinator
+        self.server = server
         self.bluetooth = bluetooth
         self.logger = logger
         self.openSettings = openSettings
@@ -44,6 +47,11 @@ final class MenuBarController: NSObject {
         coordinator.$status
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.refresh() }
+            .store(in: &cancellables)
+
+        server.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateIcon() }
             .store(in: &cancellables)
 
         // Peripheral list edits change the count immediately.
@@ -153,6 +161,9 @@ final class MenuBarController: NSObject {
     /// underneath once there has been one.
     private func statusLines() -> [String] {
         var lines: [String] = []
+        if case .failed(let why) = server.state {
+            lines.append("⚠ Not listening: \(why)")
+        }
         let total = settings.peripherals.count
         if total == 0 {
             lines.append("Not configured — open Settings")
@@ -207,6 +218,9 @@ final class MenuBarController: NSObject {
 
         if case .running = coordinator.status {
             symbolName = "arrow.triangle.2.circlepath"
+            alpha = 1.0
+        } else if case .failed = server.state {
+            symbolName = "exclamationmark.triangle"
             alpha = 1.0
         } else if total == 0 {
             symbolName = "keyboard.badge.ellipsis"

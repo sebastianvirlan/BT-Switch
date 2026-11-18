@@ -216,5 +216,88 @@ test("switch lock is exclusive") {
     check(l.tryAcquire(), "reacquire")
 }
 
+// MARK: Token hygiene & fingerprints
+
+test("token normalisation strips invisible whitespace") {
+    check(BTProtocol.normalizeToken(" \(token) \n") == token, "trailing space/newline")
+    check(BTProtocol.normalizeToken("0123456789ABCDEF\n0123456789abcdef") == token, "wrapped + uppercase")
+    check(BTProtocol.isValidToken(token), "valid")
+    check(!BTProtocol.isValidToken(token + "0"), "too long")
+    check(!BTProtocol.isValidToken("0123456789ABCDEF0123456789abcdef"), "uppercase is not normalised")
+    check(!BTProtocol.isValidToken("g123456789abcdef0123456789abcdef"), "non-hex")
+}
+
+test("normalised token signs identically") {
+    // The old false "token mismatch": one Mac stored a trailing space.
+    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
+    check(BTProtocol.verify(authLine: auth, command: cmd, token: BTProtocol.normalizeToken(token + " "),
+                            now: now, replayGuard: ReplayGuard()) == .ok, "normalised token verifies")
+}
+
+test("fingerprints") {
+    let fp = BTProtocol.fingerprint(token)
+    check(fp.count == 6 && fp.allSatisfy(\.isHexDigit), "6 hex chars, got \(fp)")
+    check(fp == BTProtocol.fingerprint(token), "stable")
+    check(fp != BTProtocol.fingerprint("ffffffffffffffffffffffffffffffff"), "differs")
+    check(BTProtocol.fingerprint("") == "none", "empty")
+}
+
+test("bad_token reply says which side is wrong") {
+    let other = "ffffffffffffffffffffffffffffffff"
+    let ours = BTProtocol.fingerprint(token), theirs = BTProtocol.fingerprint(other)
+
+    let mismatch = BTProtocol.describe(response: "ERR bad_token \(theirs)", localToken: token)
+    check(mismatch.contains(ours) && mismatch.contains(theirs) && mismatch.contains("mismatch"), mismatch)
+
+    let same = BTProtocol.describe(response: "ERR bad_token \(ours)", localToken: token)
+    check(same.contains("tokens match") && same.contains("same BTSwitch build"), same)
+
+    let none = BTProtocol.describe(response: "ERR bad_token none", localToken: token)
+    check(none.contains("no token set"), none)
+
+    check(BTProtocol.describe(response: "ERR bad_token") == "token mismatch", "legacy reply without detail")
+    check(BTProtocol.describe(response: "huh").contains("unexpected response"), "garbage")
+}
+
+test("error reply parsing") {
+    check(ErrorReply("ERR bad_token abc123") == ErrorReply("ERR bad_token abc123"), "equatable")
+    check(ErrorReply("ERR bad_token abc123")?.code == "bad_token", "code")
+    check(ErrorReply("ERR bad_token abc123")?.detail == "abc123", "detail")
+    check(ErrorReply("ERR busy")?.detail == nil, "no detail")
+    check(ErrorReply("OK pong") == nil, "not an error")
+    check(ErrorReply("ERR ") == nil, "empty code")
+}
+
+// MARK: Ping identity
+
+test("ping reply round-trips identity") {
+    let r = PingReply(instanceID: "abc123def456", name: "Studio Mac\nmini")
+    check(r.encoded == "OK pong abc123def456 Studio Mac mini", "newline flattened, got \(r.encoded)")
+    let parsed = PingReply(r.encoded)
+    check(parsed?.instanceID == "abc123def456", "id")
+    check(parsed?.name == "Studio Mac mini", "name with spaces")
+}
+
+test("ping reply accepts bare pong, rejects others") {
+    let bare = PingReply("OK pong")
+    check(bare != nil && bare?.instanceID == nil && bare?.name == nil, "bare pong from earlier build")
+    check(PingReply("OK pong abc123")?.name == nil, "id only")
+    check(PingReply("OK pongish") == nil, "prefix must be a whole word")
+    check(PingReply("ERR busy") == nil, "error")
+}
+
+// MARK: Network failures
+
+test("socket errors map to user-facing causes") {
+    check(NetworkFailure.from(posix: .ECONNREFUSED, host: "h", port: 1) == .refused(host: "h", port: 1), "refused")
+    check(NetworkFailure.from(posix: .EHOSTUNREACH, host: "h", port: 1) == .unreachable(host: "h"), "host unreach")
+    check(NetworkFailure.from(posix: .ENETUNREACH, host: "h", port: 1) == .unreachable(host: "h"), "net unreach")
+    check(NetworkFailure.from(posix: .ETIMEDOUT, host: "h", port: 1) == .connectTimeout(host: "h"), "timeout")
+    check(NetworkFailure.from(posix: .EPERM, host: "h", port: 1) == .localNetworkDenied, "privacy denial")
+    check(NetworkFailure.from(posix: .EINVAL, host: "h", port: 1) == nil, "no better explanation")
+    check("\(NetworkFailure.refused(host: "mac.local", port: 52525))".contains("isn't running"), "refused text")
+    check("\(NetworkFailure.localNetworkDenied)".contains("Local Network"), "denied text")
+}
+
 print("\n\(checks - failures)/\(checks) checks passed")
 exit(failures == 0 ? 0 : 1)

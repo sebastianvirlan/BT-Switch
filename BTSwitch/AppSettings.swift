@@ -1,10 +1,27 @@
 import Foundation
 import Combine
+import SystemConfiguration
 
 enum AppInfo {
     static let bundleID = Bundle.main.bundleIdentifier ?? "io.github.sebastianvirlan.btswitch"
     /// Bundle ID used by earlier builds; settings are migrated from it once.
     static let legacyBundleID = "com.user.btswitch"
+
+    /// Random per-install ID, sent in ping replies so a Mac can tell when
+    /// its destination address actually points back at itself.
+    static let instanceID: String = {
+        let key = "instanceID"
+        if let id = UserDefaults.standard.string(forKey: key), !id.isEmpty { return id }
+        let id = String(BTProtocol.makeNonce().prefix(12))
+        UserDefaults.standard.set(id, forKey: key)
+        return id
+    }()
+
+    /// The computer name from System Settings → General → Sharing.
+    /// (Host.current().localizedName can block on DNS, so avoid it.)
+    static var computerName: String {
+        (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? "this Mac"
+    }
 }
 
 /// User-configurable settings. Destination, peripherals and port live in
@@ -28,8 +45,16 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(peripheralsCSV, forKey: Keys.peripherals) }
     }
 
+    /// Always normalised: whitespace stripped, lowercase.
     @Published var token: String {
         didSet {
+            let normalized = BTProtocol.normalizeToken(token)
+            if normalized != token {
+                // Assigning inside didSet doesn't re-run didSet, so carry on
+                // and persist the clean value below.
+                token = normalized
+            }
+            guard token != oldValue else { return }
             if !Keychain.writeToken(token) {
                 AppLogger.shared.error("could not save token to Keychain")
             }
@@ -65,8 +90,17 @@ final class AppSettings: ObservableObject {
         // used to crash the app on every launch.
         self.port = BTProtocol.port(from: savedPort) != nil ? savedPort : BTProtocol.defaultPort
 
-        self.token = Self.loadTokenMigratingFromDefaults()
+        let stored = Self.loadTokenMigratingFromDefaults()
+        let clean = BTProtocol.normalizeToken(stored)
+        if clean != stored {
+            // Earlier builds saved pasted whitespace verbatim, which caused
+            // spurious "token mismatch" errors.
+            Keychain.writeToken(clean)
+        }
+        self.token = clean
     }
+
+    var tokenFingerprint: String { BTProtocol.fingerprint(token) }
 
     /// Reads the token from the Keychain, moving it out of UserDefaults
     /// (current or legacy domain) the first time.

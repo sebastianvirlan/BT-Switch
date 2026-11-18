@@ -5,6 +5,7 @@ struct SettingsView: View {
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var logger: AppLogger
     @EnvironmentObject var coordinator: SwitchCoordinator
+    @EnvironmentObject var server: NetworkServer
 
     @State private var testStatus: String?
     @State private var testing = false
@@ -60,6 +61,7 @@ struct SettingsView: View {
                     Text("1–65535; restart app after changing")
                         .font(.caption).foregroundColor(.secondary)
                 }
+                listenerStatus
             }
 
             Divider().padding(.vertical, 4)
@@ -70,13 +72,31 @@ struct SettingsView: View {
                     Text(testing ? "Testing…" : "Test Connection")
                 }
                 .disabled(testing || settings.destination.isEmpty || settings.token.isEmpty)
-                if let s = testStatus {
-                    Text(s).font(.callout).foregroundColor(s.hasPrefix("✓") ? .green : .red)
-                }
                 Spacer()
+            }
+            if let s = testStatus {
+                Text(s).font(.callout).foregroundColor(s.hasPrefix("✓") ? .green : .red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
 
             Spacer()
+        }
+    }
+
+    /// Whether this Mac can be reached by the other one.
+    @ViewBuilder private var listenerStatus: some View {
+        switch server.state {
+        case .starting:
+            Label("Starting listener…", systemImage: "circle.dotted")
+                .font(.caption).foregroundColor(.secondary)
+        case .listening(let port):
+            Label("\(AppInfo.computerName) is listening on port \(port)", systemImage: "checkmark.circle.fill")
+                .font(.caption).foregroundColor(.green)
+        case .failed(let why):
+            Label("Not listening: \(why)", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption).foregroundColor(.red)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -98,6 +118,20 @@ struct SettingsView: View {
                     NSPasteboard.general.setString(settings.token, forType: .string)
                 }
                 .disabled(settings.token.isEmpty)
+            }
+
+            HStack(spacing: 6) {
+                Text("Fingerprint:").font(.callout)
+                Text(settings.tokenFingerprint)
+                    .font(.system(.callout, design: .monospaced)).bold()
+                    .textSelection(.enabled)
+                Text("— must be the same on both Macs")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            if !settings.token.isEmpty && !BTProtocol.isValidToken(settings.token) {
+                Text("This doesn't look like a BTSwitch token (32 hex characters). Copy it again with the Copy button on the other Mac.")
+                    .font(.caption).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack {
@@ -201,13 +235,20 @@ network, and it is stored in your Keychain.
             DispatchQueue.main.async {
                 self.testing = false
                 switch r {
-                case .success(let s) where s == "OK pong":
-                    self.testStatus = "✓ \(dest) is reachable"
                 case .success(let s):
-                    if let code = BTProtocol.errorCode(in: s) {
-                        self.testStatus = "✗ \(BTProtocol.describe(errorCode: code))"
+                    if let pong = PingReply(s) {
+                        if pong.instanceID == AppInfo.instanceID {
+                            self.testStatus = "✗ \(dest) is this Mac; enter the other Mac's address"
+                        } else if let name = pong.name {
+                            self.testStatus = "✓ reachable: \(name), tokens match"
+                        } else {
+                            self.testStatus = "✓ \(dest) is reachable, tokens match"
+                        }
+                    } else if BTProtocol.errorCode(in: s) == "busy" {
+                        // Auth passed; the other Mac is just mid-switch.
+                        self.testStatus = "✓ \(dest) is reachable, tokens match (it's switching right now)"
                     } else {
-                        self.testStatus = "✗ unexpected response: \(s)"
+                        self.testStatus = "✗ \(BTProtocol.describe(response: s, localToken: token))"
                     }
                 case .failure(let e):
                     self.testStatus = "✗ \(e)"

@@ -123,13 +123,46 @@ enum BTProtocol {
         return diff == 0
     }
 
+    // MARK: Token
+
+    /// Strips all whitespace (pasted tokens often carry a trailing space or
+    /// newline that is invisible in the text field) and lowercases.
+    static func normalizeToken(_ s: String) -> String {
+        s.filter { !$0.isWhitespace }.lowercased()
+    }
+
+    /// Generated tokens are 32 lowercase hex characters.
+    static func isValidToken(_ s: String) -> Bool {
+        s.count == 32 && s.allSatisfy { $0.isHexDigit && !$0.isUppercase }
+    }
+
+    /// Short, non-secret identifier for a token so two Macs can be compared
+    /// at a glance. 24 bits of a hash reveal nothing usable about a 128-bit
+    /// token, so it's safe to show and to send back in "ERR bad_token".
+    static func fingerprint(_ token: String) -> String {
+        guard !token.isEmpty else { return "none" }
+        let digest = SHA256.hash(data: Data("btswitch-fingerprint\n\(token)".utf8))
+        return String(hex(digest).prefix(6))
+    }
+
     // MARK: Errors
 
-    /// Human-readable text for an "ERR <code>" response.
-    static func describe(errorCode code: String) -> String {
+    /// Human-readable text for an "ERR <code> [detail]" response.
+    /// `localToken` lets a bad_token reply say which side is wrong.
+    static func describe(errorCode code: String, detail: String? = nil, localToken: String? = nil) -> String {
         switch code {
-        case "bad_token": return "token mismatch"
-        case "stale_request": return "the two Macs' clocks differ by more than \(Int(maxClockSkew))s"
+        case "bad_token":
+            guard let theirs = detail, let local = localToken else { return "token mismatch" }
+            let ours = fingerprint(local)
+            if theirs == "none" {
+                return "the other Mac has no token set; paste this Mac's token (\(ours)) there"
+            }
+            if theirs == ours {
+                return "tokens match (\(ours)) but the request was rejected; make sure both Macs run the same BTSwitch build"
+            }
+            return "token mismatch: this Mac \(ours), other Mac \(theirs); copy the token from one Mac to the other"
+        case "bad_auth": return "malformed request; make sure both Macs run the same BTSwitch build"
+        case "stale_request": return "the two Macs' clocks differ by more than \(Int(maxClockSkew))s; turn on automatic date & time on both"
         case "replay": return "request rejected as a replay"
         case "busy": return "the other Mac is switching right now; try again"
         case "bad_protocol": return "the other Mac runs an older BTSwitch; update both Macs"
@@ -139,10 +172,17 @@ enum BTProtocol {
         }
     }
 
-    /// If `response` is "ERR <code>", returns the code.
+    /// Describes any non-success response: an "ERR …" reply or something unexpected.
+    static func describe(response: String, localToken: String? = nil) -> String {
+        if let e = ErrorReply(response) {
+            return describe(errorCode: e.code, detail: e.detail, localToken: localToken)
+        }
+        return "unexpected response: \(response)"
+    }
+
+    /// If `response` is "ERR <code> [detail]", returns the code.
     static func errorCode(in response: String) -> String? {
-        guard response.hasPrefix("ERR ") else { return nil }
-        return String(response.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+        ErrorReply(response)?.code
     }
 
     // MARK: Port
@@ -158,6 +198,98 @@ enum BTProtocol {
 
     static func hex<S: Sequence>(_ bytes: S) -> String where S.Element == UInt8 {
         bytes.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// MARK: - Replies
+
+/// "ERR <code> [detail]"
+struct ErrorReply: Equatable {
+    let code: String
+    let detail: String?
+
+    init?(_ response: String) {
+        guard response.hasPrefix("ERR ") else { return nil }
+        let rest = response.dropFirst(4).trimmingCharacters(in: .whitespaces)
+        let parts = rest.split(separator: " ", maxSplits: 1)
+        guard let first = parts.first else { return nil }
+        code = String(first)
+        detail = parts.count > 1 ? String(parts[1]) : nil
+    }
+}
+
+/// "OK pong [<instance_id> <computer name>]". The identity lets the caller
+/// confirm which machine answered, and notice when the destination address
+/// points back at itself. A bare "OK pong" (earlier v2 builds) is accepted.
+struct PingReply: Equatable {
+    let instanceID: String?
+    let name: String?
+
+    init(instanceID: String, name: String) {
+        self.instanceID = instanceID
+        self.name = name
+    }
+
+    init?(_ response: String) {
+        guard response == "OK pong" || response.hasPrefix("OK pong ") else { return nil }
+        let rest = response.dropFirst("OK pong".count).trimmingCharacters(in: .whitespaces)
+        let parts = rest.split(separator: " ", maxSplits: 1)
+        instanceID = parts.first.map(String.init)
+        name = parts.count > 1 ? String(parts[1]) : nil
+    }
+
+    var encoded: String {
+        guard let id = instanceID else { return "OK pong" }
+        // Keep it on one line whatever the computer is called.
+        let n = (name ?? "").components(separatedBy: .newlines).joined(separator: " ")
+        return n.isEmpty ? "OK pong \(id)" : "OK pong \(id) \(n)"
+    }
+}
+
+// MARK: - Network failures
+
+/// Why a request to the other Mac failed, phrased for the user.
+enum NetworkFailure: Error, Equatable, CustomStringConvertible {
+    case invalidAddress(String)
+    case refused(host: String, port: Int)
+    case unreachable(host: String)
+    case localNetworkDenied
+    case cannotResolve(host: String)
+    case connectTimeout(host: String)
+    case noResponse(host: String, seconds: Int)
+    case other(String)
+
+    var description: String {
+        switch self {
+        case .invalidAddress(let s):
+            return "invalid address: \(s)"
+        case .refused(let host, let port):
+            return "\(host) refused the connection; BTSwitch isn't running there or listens on a port other than \(port)"
+        case .unreachable(let host):
+            return "no route to \(host); check it's awake and on the same network"
+        case .localNetworkDenied:
+            return "macOS blocked the connection; allow BTSwitch under System Settings → Privacy & Security → Local Network"
+        case .cannotResolve(let host):
+            return "can't resolve \(host); try the other Mac's IP address instead"
+        case .connectTimeout(let host):
+            return "timed out connecting to \(host); check the address and that it's awake"
+        case .noResponse(let host, let seconds):
+            return "\(host) accepted the connection but didn't answer within \(seconds)s"
+        case .other(let s):
+            return s
+        }
+    }
+
+    /// Maps a socket error to a user-facing cause; nil if there's no better
+    /// explanation than the system's own message.
+    static func from(posix code: POSIXErrorCode, host: String, port: Int) -> NetworkFailure? {
+        switch code {
+        case .ECONNREFUSED: return .refused(host: host, port: port)
+        case .EHOSTUNREACH, .ENETUNREACH, .EHOSTDOWN, .ENETDOWN: return .unreachable(host: host)
+        case .ETIMEDOUT: return .connectTimeout(host: host)
+        case .EPERM, .EACCES: return .localNetworkDenied
+        default: return nil
+        }
     }
 }
 
