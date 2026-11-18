@@ -3,16 +3,16 @@ import IOBluetooth
 
 /// Wraps the IOBluetooth primitives we need.
 ///
-/// All work is funneled through a dedicated background queue. This is critical
-/// for IOBluetoothDevicePair.start() — its delegate callbacks are delivered on
-/// the queue from which start() was invoked, and openConnection() blocks that
-/// queue until the radio handshake completes. Doing this on the main thread
-/// of a CLI deadlocks; doing it inside an app's main thread also blocks the UI.
-/// The dedicated queue keeps both problems away.
+/// Every IOBluetooth call — reads included — is funneled through one
+/// dedicated serial queue, so the framework is never used from two threads
+/// at once. This is also what keeps IOBluetoothDevicePair.start() working:
+/// its delegate callbacks must not be blocked by openConnection(), which
+/// blocks its caller until the radio handshake completes. Doing this on the
+/// main thread would also freeze the UI.
 ///
-/// Public methods are synchronous from the caller's perspective but always run
-/// on the internal queue. Callers should NEVER call these from the main thread
-/// without dispatching, since some of them block for seconds.
+/// Synchronous methods block the caller (sometimes for seconds) and must not
+/// be called from the main thread or from the internal queue. UI code uses
+/// the async `connectedCount` instead.
 final class BluetoothController {
     enum ConnectError: Error, CustomStringConvertible {
         case bluetoothOff
@@ -36,60 +36,89 @@ final class BluetoothController {
         }
     }
 
+    enum RemoveResult: Equatable, CustomStringConvertible {
+        case removed
+        case notPaired          // nothing to do
+        case stillPaired        // `remove` ran but the device is still paired
+        case unsupported        // private selector missing (macOS changed)
+        case deviceNotFound
+
+        var description: String {
+            switch self {
+            case .removed: return "removed"
+            case .notPaired: return "not paired (no-op)"
+            case .stillPaired: return "remove had no effect; device still paired"
+            case .unsupported: return "remove API unavailable on this macOS version"
+            case .deviceNotFound: return "device not found"
+            }
+        }
+
+        var isFailure: Bool { self == .stillPaired || self == .unsupported }
+    }
+
     private static let invalidRSSI: Int8 = 127
-    private let queue = DispatchQueue(label: "com.user.btswitch.bluetooth", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "\(AppInfo.bundleID).bluetooth", qos: .userInitiated)
 
-    // MARK: - Read-only state (cheap, can be called from any thread)
+    // MARK: - Reads
 
-    var isPoweredOn: Bool {
+    func isConnected(_ mac: String) -> Bool {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return queue.sync { Self.device(mac)?.isConnected() ?? false }
+    }
+
+    /// Counts connected peripherals without blocking the caller. The
+    /// completion runs on the main queue. If a connect is in progress the
+    /// answer arrives once it finishes.
+    func connectedCount(_ macs: [String], completion: @escaping (Int) -> Void) {
+        queue.async {
+            let n = macs.filter { Self.device($0)?.isConnected() ?? false }.count
+            DispatchQueue.main.async { completion(n) }
+        }
+    }
+
+    // MARK: - Mutating ops
+
+    /// Pair-and-connect. Synchronous.
+    func connect(_ mac: String) -> Result<Void, ConnectError> {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return queue.sync { self.doConnect(mac) }
+    }
+
+    /// Hard unregister via the private "remove" selector, then confirm the
+    /// device is really gone. Synchronous.
+    func remove(_ mac: String) -> RemoveResult {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return queue.sync {
+            guard let device = Self.device(mac) else { return .deviceNotFound }
+            if !device.isPaired() { return .notPaired }
+            let sel = NSSelectorFromString("remove")
+            guard device.responds(to: sel) else { return .unsupported }
+            _ = device.perform(sel)
+
+            // The unpair is asynchronous inside bluetoothd; give it a moment.
+            let deadline = Date().addingTimeInterval(2)
+            while Date() < deadline {
+                if !device.isPaired() { return .removed }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return .stillPaired
+        }
+    }
+
+    // MARK: - Internal (run on `queue` only)
+
+    private static func device(_ mac: String) -> IOBluetoothDevice? {
+        IOBluetoothDevice(addressString: mac)
+    }
+
+    private static var isPoweredOn: Bool {
         guard let host = IOBluetoothHostController.default() else { return false }
         return host.powerState != kBluetoothHCIPowerStateOFF
     }
 
-    func isConnected(_ mac: String) -> Bool {
-        guard let dev = IOBluetoothDevice(addressString: mac) else { return false }
-        return dev.isConnected()
-    }
-
-    func rssi(_ mac: String) -> Int8? {
-        guard let dev = IOBluetoothDevice(addressString: mac) else { return nil }
-        let r = dev.rssi()
-        return r == Self.invalidRSSI ? nil : r
-    }
-
-    // MARK: - Mutating ops (run on the dedicated queue)
-
-    /// Pair-and-connect. Synchronous. Caller must NOT be on the main thread.
-    func connect(_ mac: String) -> Result<Void, ConnectError> {
-        return queue.sync { self.doConnect(mac) }
-    }
-
-    /// Soft disconnect. Synchronous.
-    func disconnect(_ mac: String) -> Bool {
-        return queue.sync {
-            guard let device = IOBluetoothDevice(addressString: mac) else { return false }
-            if !device.isConnected() { return true }
-            return device.closeConnection() == kIOReturnSuccess
-        }
-    }
-
-    /// Hard unregister via private "remove" selector. Synchronous.
-    @discardableResult
-    func remove(_ mac: String) -> Bool {
-        return queue.sync {
-            guard let device = IOBluetoothDevice(addressString: mac) else { return false }
-            let sel = NSSelectorFromString("remove")
-            guard device.responds(to: sel) else { return false }
-            _ = device.perform(sel)
-            return true
-        }
-    }
-
-    // MARK: - Internal
-
     private func doConnect(_ mac: String) -> Result<Void, ConnectError> {
-        guard isPoweredOn else { return .failure(.bluetoothOff) }
-        guard let device = IOBluetoothDevice(addressString: mac) else {
+        guard Self.isPoweredOn else { return .failure(.bluetoothOff) }
+        guard let device = Self.device(mac) else {
             return .failure(.deviceNotFound(mac))
         }
 
@@ -104,28 +133,28 @@ final class BluetoothController {
         let delegate = PairDelegate()
         devicePair.delegate = delegate
 
-        let pairRC = devicePair.start()
-        if pairRC != kIOReturnSuccess {
-            return .failure(.pairStartFailed(mac, pairRC))
+        // Keep the pair object and its delegate alive until we are done
+        // polling, since pairing callbacks can still arrive meanwhile.
+        return withExtendedLifetime((devicePair, delegate)) {
+            let pairRC = devicePair.start()
+            if pairRC != kIOReturnSuccess {
+                return .failure(.pairStartFailed(mac, pairRC))
+            }
+
+            // openConnection blocks while the radio handshake completes.
+            let openRC = device.openConnection()
+            if openRC != kIOReturnSuccess {
+                return .failure(.openConnectionFailed(mac, openRC))
+            }
+
+            // isConnected can lag a bit. Poll briefly.
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                if device.isConnected() { return .success(()) }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            return .failure(.notConnectedAfterOpen(mac))
         }
-
-        // openConnection blocks while the radio handshake completes.
-        let openRC = device.openConnection()
-
-        withExtendedLifetime(delegate) { }
-        withExtendedLifetime(devicePair) { }
-
-        if openRC != kIOReturnSuccess {
-            return .failure(.openConnectionFailed(mac, openRC))
-        }
-
-        // isConnected can lag a bit. Poll briefly.
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if device.isConnected() { return .success(()) }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        return .failure(.notConnectedAfterOpen(mac))
     }
 }
 

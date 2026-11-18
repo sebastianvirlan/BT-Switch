@@ -12,6 +12,17 @@ If you have two Macs on the same desk — say a personal one and a work one — 
 
 It works with any Bluetooth peripheral that holds only one bond at a time, which includes every Apple Magic peripheral.
 
+### Reliability
+
+BTSwitch uses the same Bluetooth approach as Blue Switch (`IOBluetoothDevicePair.start()` plus the private `remove` selector), with several reliability fixes:
+
+- All IOBluetooth work runs on one dedicated background queue, so pairing callbacks aren't blocked by `openConnection` (without this, pairing hangs after `devicePairingStarted`) and the framework is never used from two threads at once.
+- A hard RSSI check fails fast on sleeping peripherals instead of timing out after 10–20 seconds.
+- It pings the destination *before* removing peripherals locally, so a network failure can't leave you with no working keyboard.
+- If a peripheral doesn't arrive on the destination, BTSwitch reconnects it to the source Mac.
+- Only one switch runs at a time. If both Macs are clicked at once, both back off instead of fighting over the peripherals.
+- Connection attempts are retried up to 3 times, and `isConnected` is polled briefly afterwards because it can lag.
+
 ## How it works
 
 You install BTSwitch on both Macs. Each app:
@@ -34,8 +45,8 @@ Click the icon on Mac A, peripherals move to Mac B. Click on Mac B, peripherals 
 Clone the repo on each Mac and build:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/BTSwitch.git
-cd BTSwitch
+git clone https://github.com/sebastianvirlan/BT-Switch.git
+cd BT-Switch
 ./build.sh
 ```
 
@@ -71,7 +82,7 @@ Open BTSwitch from `/Applications`. macOS will prompt for:
 - **Local Network permission** — required so the two Macs can talk
 
 Grant both. If you accidentally denied either, enable them under
-System Settings → Privacy & Security.
+System Settings → Privacy & Security. If BTSwitch isn't listed there, delete and reinstall the app.
 
 ### 2. Open Settings
 
@@ -150,6 +161,18 @@ The peripheral isn't responding to wake signals. Press a key or click the mouse 
 
 Both Macs must use the same token. Open Settings → Token on each, copy from one, paste on the other. The Copy button is there to avoid typos.
 
+### "clocks differ by more than 60s"
+
+Requests are timestamped to prevent replay, so both Macs' clocks must be within 60 seconds of each other. Enable System Settings → General → Date & Time → *Set time and date automatically* on both.
+
+### "the other Mac runs an older/newer BTSwitch"
+
+Version 2 changed the network protocol. Update BTSwitch on both Macs.
+
+### Keychain prompt after rebuilding
+
+The token is stored in your Keychain. Because `build.sh` ad-hoc signs the app, each rebuild looks like a new app to the Keychain, and macOS asks whether BTSwitch may read the token. Click **Always Allow**.
+
 ### Menu bar icon does nothing on click
 
 If you haven't configured a destination/peripherals/token yet, left-click opens Settings instead of switching. Fill in the General and Token tabs first.
@@ -170,11 +193,14 @@ Settings → **Log** tab shows everything BTSwitch has done. Click **Copy All** 
 
 ## Security
 
-- BTSwitch only listens on the configured port (default 52525)
-- Every request is authenticated by the shared token; unauthenticated requests are dropped
-- The token is stored in macOS UserDefaults (`~/Library/Preferences/com.user.btswitch.plist`)
-- No outbound traffic except to the destination IP you configure
-- No telemetry, no analytics, no network calls outside the LAN
+- BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses (private IPv4 ranges, link-local, IPv6 unique-local, loopback, and 100.64.0.0/10 for Tailscale-style VPNs).
+- Every request is signed with HMAC-SHA256 using the shared token. The token itself never crosses the network.
+- Each request carries a timestamp and a one-time nonce, so a captured request can't be replayed.
+- The token is stored in the macOS Keychain. Earlier versions kept it in UserDefaults; it's moved to the Keychain automatically on first launch.
+- No outbound traffic except to the destination you configure.
+- No telemetry, no analytics, no network calls outside the LAN.
+- Traffic is not encrypted. Anyone on your network can see which commands are sent and which peripheral addresses are involved, but can't forge or replay them.
+- Removing a peripheral relies on a private IOBluetooth method. If a macOS update removes it, BTSwitch logs a warning instead of silently claiming success.
 
 ## Configuration reference
 
@@ -198,7 +224,9 @@ BTSwitch/
 ├── BTSwitch/
 │   ├── BTSwitchApp.swift          App entry, window management
 │   ├── MenuBarController.swift    Menu bar icon and click handling
-│   ├── Settings.swift             User-configurable settings
+│   ├── AppSettings.swift          User-configurable settings
+│   ├── Keychain.swift             Token storage
+│   ├── Protocol.swift             Wire protocol, auth, parsing (pure, unit-tested)
 │   ├── SettingsView.swift         Settings UI
 │   ├── SwitchCoordinator.swift    Orchestrates a switch
 │   ├── BluetoothController.swift  Bluetooth pair/connect/remove
@@ -208,11 +236,24 @@ BTSwitch/
 │   ├── Info.plist
 │   └── BTSwitch.entitlements
 ├── project.yml                    XcodeGen spec
+├── Tests/main.swift               Unit tests for Protocol.swift
 ├── build.sh                       Build script (no Xcode project required)
+├── test.sh                        Run unit tests (no Xcode required)
 └── README.md
 ```
 
-`build.sh` invokes `swiftc` directly and ad-hoc signs the resulting bundle. The app uses public Apple frameworks only — `IOBluetooth`, `Network`, `AppKit`, `SwiftUI`, `Combine`.
+`build.sh` invokes `swiftc` directly and ad-hoc signs the resulting bundle. The app uses Apple frameworks only: `IOBluetooth`, `Network`, `AppKit`, `SwiftUI`, `Combine`, `CryptoKit`. The one private API is the `remove` selector described above.
+
+Run the unit tests with:
+
+```bash
+./test.sh
+```
+
+### Upgrading from 1.x
+
+- The protocol changed to `BT-SWITCH/2`. Update **both** Macs.
+- The bundle ID changed from `com.user.btswitch` to `io.github.sebastianvirlan.btswitch`. Your destination, peripherals, port and token are migrated automatically, but macOS treats it as a new app, so you'll be asked for Bluetooth and Local Network permission again.
 
 ## Contributing
 

@@ -41,10 +41,7 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                     .disableAutocorrection(true)
                 let parsed = settings.peripherals
-                let invalid = settings.peripheralsCSV
-                    .split(separator: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty && !AppSettings.isValidMAC($0) }
+                let invalid = MAC.invalidEntries(settings.peripheralsCSV)
                 if !invalid.isEmpty {
                     Text("Invalid MAC: \(invalid.joined(separator: ", "))")
                         .font(.caption).foregroundColor(.red)
@@ -60,7 +57,7 @@ struct SettingsView: View {
                     TextField("52525", value: $settings.port, formatter: NumberFormatter())
                         .textFieldStyle(.roundedBorder)
                         .frame(width: 100)
-                    Text("(restart app after changing)")
+                    Text("1–65535; restart app after changing")
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
@@ -117,10 +114,11 @@ struct SettingsView: View {
             Text("How tokens work")
                 .font(.headline)
             Text("""
-The token is a 32-character secret that both Macs use to authenticate \
+The token is a 32-character secret that both Macs use to sign \
 requests. Pick one Mac, copy its token, paste it on the other Mac. The same \
 token is used for incoming and outgoing requests, so bidirectional \
-switching works with one token.
+switching works with one token. The token itself is never sent over the \
+network, and it is stored in your Keychain.
 """)
             .font(.callout).foregroundColor(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -148,7 +146,7 @@ switching works with one token.
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(logger.entries) { entry in
                             HStack(alignment: .top, spacing: 8) {
-                                Text(timeFormatter.string(from: entry.timestamp))
+                                Text(Self.timeFormatter.string(from: entry.timestamp))
                                     .font(.system(.caption, design: .monospaced))
                                     .foregroundColor(.secondary)
                                 Text(entry.level)
@@ -175,11 +173,11 @@ switching works with one token.
         }
     }
 
-    private var timeFormatter: DateFormatter {
+    private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         return f
-    }
+    }()
 
     private func color(for level: String) -> Color {
         switch level {
@@ -205,10 +203,12 @@ switching works with one token.
                 switch r {
                 case .success(let s) where s == "OK pong":
                     self.testStatus = "✓ \(dest) is reachable"
-                case .success(let s) where s == "ERR bad_token":
-                    self.testStatus = "✗ token mismatch"
                 case .success(let s):
-                    self.testStatus = "✗ unexpected response: \(s)"
+                    if let code = BTProtocol.errorCode(in: s) {
+                        self.testStatus = "✗ \(BTProtocol.describe(errorCode: code))"
+                    } else {
+                        self.testStatus = "✗ unexpected response: \(s)"
+                    }
                 case .failure(let e):
                     self.testStatus = "✗ \(e)"
                 }

@@ -14,8 +14,7 @@ final class AppLogger: ObservableObject {
 
     @Published private(set) var entries: [Entry] = []
     private let maxEntries = 500
-    private let osLog = OSLog(subsystem: "com.user.btswitch", category: "general")
-    private let queue = DispatchQueue(label: "com.user.btswitch.logger")
+    private let osLog = OSLog(subsystem: AppInfo.bundleID, category: "general")
 
     private init() {}
 

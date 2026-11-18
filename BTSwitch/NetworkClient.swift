@@ -1,7 +1,7 @@
 import Foundation
 import Network
 
-/// Client side of the BT-SWITCH/1 protocol.
+/// Client side of the BT-SWITCH/2 protocol (see Protocol.swift).
 final class NetworkClient {
     enum Failure: Error, CustomStringConvertible {
         case invalidHost(String)
@@ -9,8 +9,6 @@ final class NetworkClient {
         case sendFailed(String)
         case receiveFailed(String)
         case timeout
-        case rejected(String)
-        case malformed(String)
 
         var description: String {
             switch self {
@@ -19,27 +17,28 @@ final class NetworkClient {
             case .sendFailed(let s): return "send failed: \(s)"
             case .receiveFailed(let s): return "receive failed: \(s)"
             case .timeout: return "timeout"
-            case .rejected(let s): return "destination rejected: \(s)"
-            case .malformed(let s): return "malformed response: \(s)"
             }
         }
     }
 
-    /// Sends one request, returns the single-line response.
+    /// Sends one signed request, returns the single-line response.
     /// Synchronous (blocks until done or timeout). Caller must NOT be on main thread.
     static func send(host: String, port: Int, command: String, token: String, timeout: TimeInterval = 30.0) -> Result<String, Failure> {
-        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+        guard let rawPort = BTProtocol.port(from: port),
+              let nwPort = NWEndpoint.Port(rawValue: rawPort) else {
             return .failure(.invalidHost("port \(port)"))
         }
-        let nwHost = NWEndpoint.Host(host)
-        let conn = NWConnection(host: nwHost, port: nwPort, using: .tcp)
-        let queue = DispatchQueue(label: "com.user.btswitch.client.\(UUID().uuidString)")
+        let host = host.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else { return .failure(.invalidHost("(empty)")) }
+
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        let queue = DispatchQueue(label: "\(AppInfo.bundleID).client")
 
         let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<String, Failure> = .failure(.timeout)
-        var responseBuffer = Data()
-        var didFinish = false
         let lock = NSLock()
+        var result: Result<String, Failure> = .failure(.timeout)
+        var didFinish = false
+        var responseBuffer = Data()   // only touched on `queue`
 
         func finish(_ r: Result<String, Failure>) {
             lock.lock()
@@ -51,25 +50,6 @@ final class NetworkClient {
             semaphore.signal()
         }
 
-        conn.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                let req = "BT-SWITCH/1\nTOKEN \(token)\n\(command)\n"
-                conn.send(content: req.data(using: .utf8), completion: .contentProcessed { err in
-                    if let err = err {
-                        finish(.failure(.sendFailed(err.localizedDescription)))
-                    }
-                })
-                receiveLoop()
-            case .failed(let e):
-                finish(.failure(.connectFailed(e.localizedDescription)))
-            case .cancelled:
-                // If we hit cancelled before reading anything, surface as timeout/closed.
-                break
-            default: break
-            }
-        }
-
         func receiveLoop() {
             conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, err in
                 if let err = err {
@@ -77,11 +57,10 @@ final class NetworkClient {
                     return
                 }
                 if let data = data { responseBuffer.append(data) }
-                if let s = String(data: responseBuffer, encoding: .utf8),
-                   s.contains("\n") {
+                if let s = String(data: responseBuffer, encoding: .utf8), s.contains("\n") {
                     // First line is the response.
                     let line = s.split(separator: "\n", omittingEmptySubsequences: false)[0]
-                    finish(.success(String(line)))
+                    finish(.success(String(line).trimmingCharacters(in: .whitespacesAndNewlines)))
                     return
                 }
                 if isComplete {
@@ -96,14 +75,35 @@ final class NetworkClient {
             }
         }
 
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                let req = BTProtocol.makeRequest(token: token, command: command)
+                conn.send(content: Data(req.utf8), completion: .contentProcessed { err in
+                    if let err = err {
+                        finish(.failure(.sendFailed(err.localizedDescription)))
+                    }
+                })
+                receiveLoop()
+            case .failed(let e):
+                finish(.failure(.connectFailed(e.localizedDescription)))
+            case .waiting(let e):
+                // e.g. connection refused / no route; NWConnection would keep
+                // retrying until our timeout, so fail fast instead.
+                finish(.failure(.connectFailed(e.localizedDescription)))
+            default:
+                break
+            }
+        }
+
         conn.start(queue: queue)
 
-        // Wait with timeout.
-        let waitResult = semaphore.wait(timeout: .now() + timeout)
-        if waitResult == .timedOut {
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             finish(.failure(.timeout))
         }
 
+        lock.lock()
+        defer { lock.unlock() }
         return result
     }
 }

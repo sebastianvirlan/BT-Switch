@@ -21,16 +21,20 @@ final class BTServices {
 
     private init() {
         let bt = BluetoothController()
+        // Shared so a local switch and an incoming CONNECT never overlap.
+        let lock = SwitchLock()
         self.bluetooth = bt
         self.coordinator = SwitchCoordinator(
             settings: AppSettings.shared,
             bluetooth: bt,
-            logger: AppLogger.shared
+            logger: AppLogger.shared,
+            switchLock: lock
         )
         self.server = NetworkServer(
             settings: AppSettings.shared,
             bluetooth: bt,
-            logger: AppLogger.shared
+            logger: AppLogger.shared,
+            switchLock: lock
         )
     }
 }
@@ -53,7 +57,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             try services.server.start()
-            logger.info("listener started on port \(settings.port)")
         } catch {
             logger.error("listener failed: \(error.localizedDescription)")
         }

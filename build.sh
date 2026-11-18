@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="BTSwitch"
-BUNDLE_ID="com.user.btswitch"
+BUNDLE_ID="io.github.sebastianvirlan.btswitch"
 BUILD_DIR="build"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 SOURCES_DIR="BTSwitch"
@@ -43,6 +43,7 @@ xcrun swiftc \
     -framework SwiftUI \
     -framework Combine \
     -framework Network \
+    -framework CryptoKit \
     -O \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
     $SWIFT_FILES
@@ -63,7 +64,7 @@ echo
 echo "Built: $APP_BUNDLE"
 echo
 echo "Next steps:"
-echo "  1. mv $APP_BUNDLE /Applications/"
+echo "  1. mv $APP_BUNDLE /Applications/  (install on BOTH Macs — protocol v2)"
 echo "  2. Open it (right-click → Open the first time, to bypass Gatekeeper)"
 echo "  3. Grant Bluetooth permission when prompted"
 echo "  4. Right-click the menu bar icon → Settings… to configure"

@@ -1,7 +1,7 @@
 name: BTSwitch
 
 options:
-  bundleIdPrefix: com.user
+  bundleIdPrefix: io.github.sebastianvirlan
   deploymentTarget:
     macOS: "13.0"
   developmentLanguage: en
@@ -33,7 +33,7 @@ targets:
       path: BTSwitch/BTSwitch.entitlements
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.user.btswitch
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.sebastianvirlan.btswitch
         INFOPLIST_FILE: BTSwitch/Info.plist
         CODE_SIGN_ENTITLEMENTS: BTSwitch/BTSwitch.entitlements
         # Don't try to generate Info.plist from build settings; we provide it.
