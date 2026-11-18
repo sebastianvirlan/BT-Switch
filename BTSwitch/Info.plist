@@ -29,6 +29,11 @@
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>BTSwitch needs Bluetooth access to switch your keyboard and mouse between Macs.</string>
     <!-- Local network access — we listen on TCP and connect to the other Mac. -->
+    <!-- Bonjour service used to find the other Mac by name. -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_btswitch._tcp</string>
+    </array>
     <key>NSLocalNetworkUsageDescription</key>
     <string>BTSwitch communicates with the other Mac on your local network to coordinate peripheral handoff.</string>
 </dict>

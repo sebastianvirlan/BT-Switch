@@ -19,16 +19,71 @@ final class SwitchCoordinator: ObservableObject {
     @Published private(set) var status: Status = .idle
 
     private let settings: AppSettings
+    private let pairing: PairingStore
+    private let directory: PeerDirectory
     private let bluetooth: BluetoothController
     private let logger: AppLogger
     private let switchLock: SwitchLock
     private let workQueue = DispatchQueue(label: "\(AppInfo.bundleID).coordinator", qos: .userInitiated)
 
-    init(settings: AppSettings, bluetooth: BluetoothController, logger: AppLogger, switchLock: SwitchLock) {
+    init(settings: AppSettings, pairing: PairingStore, directory: PeerDirectory,
+         bluetooth: BluetoothController, logger: AppLogger, switchLock: SwitchLock) {
         self.settings = settings
+        self.pairing = pairing
+        self.directory = directory
         self.bluetooth = bluetooth
         self.logger = logger
         self.switchLock = switchLock
+    }
+
+    /// Resolves how to reach the paired Mac. Call on main.
+    func target() -> Result<PeerTarget, NetworkFailure> {
+        guard let peer = pairing.current else { return .failure(.other("not paired with another Mac")) }
+        guard let endpoint = directory.endpoint(for: peer, port: settings.port) else {
+            return .failure(.notFound(name: peer.name))
+        }
+        return .success(PeerTarget(endpoint: endpoint, label: peer.name, key: peer.key))
+    }
+
+    /// Pings the paired Mac; `completion` gets a user-facing line on main.
+    func testConnection(completion: @escaping (_ ok: Bool, _ message: String) -> Void) {
+        let t: PeerTarget
+        switch target() {
+        case .failure(let e): return completion(false, "\(e)")
+        case .success(let x): t = x
+        }
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = NetworkClient.send(to: t, command: "PING", timeout: 5)
+            let (ok, msg): (Bool, String)
+            switch r {
+            case .success(let s):
+                if let pong = PingReply(s) {
+                    (ok, msg) = (true, "\(pong.name ?? t.label) is reachable and paired")
+                } else if BTProtocol.errorCode(in: s) == "busy" {
+                    (ok, msg) = (true, "\(t.label) is reachable and paired (it's busy right now)")
+                } else {
+                    (ok, msg) = (false, BTProtocol.describe(response: s))
+                }
+            case .failure(let e):
+                (ok, msg) = (false, "\(e)")
+            }
+            DispatchQueue.main.async { completion(ok, msg) }
+        }
+    }
+
+    /// Forgets the paired Mac here, and tells it to forget this one too
+    /// (best effort: if it's unreachable it'll answer "not paired" later).
+    func unpair() {
+        guard let peer = pairing.current else { return }
+        let t = try? target().get()
+        pairing.clear()
+        logger.info("unpaired from \(peer.name)")
+        guard let t = t else { return }
+        workQueue.async { [logger] in
+            if case .failure(let e) = NetworkClient.send(to: t, command: "UNPAIR", timeout: 3) {
+                logger.warn("couldn't tell \(peer.name) about the unpairing: \(e)")
+            }
+        }
     }
 
     /// True while a switch started from this Mac is in flight.
@@ -39,14 +94,15 @@ final class SwitchCoordinator: ObservableObject {
 
     /// Kick off a switch. Non-blocking — observe `status` for progress.
     func switchToDestination() {
-        let dest = settings.destination.trimmingCharacters(in: .whitespaces)
         let macs = settings.peripherals
-        let token = settings.token
-        let port = settings.port
-
-        guard !dest.isEmpty else { return fail("destination not configured") }
+        guard pairing.current != nil else { return fail("not paired with another Mac; pair in Settings") }
         guard !macs.isEmpty else { return fail("no peripherals configured") }
-        guard !token.isEmpty else { return fail("no token configured") }
+        let t: PeerTarget
+        switch target() {
+        case .failure(let e): return fail("\(e)")
+        case .success(let x): t = x
+        }
+        let dest = t.label
 
         // Also blocks while the other Mac is pushing peripherals to us.
         guard switchLock.tryAcquire() else {
@@ -60,13 +116,14 @@ final class SwitchCoordinator: ObservableObject {
         workQueue.async { [weak self] in
             guard let self = self else { return }
             defer { self.switchLock.release() }
-            self.runSwitch(dest: dest, port: port, macs: macs, token: token)
+            self.runSwitch(target: t, macs: macs)
         }
     }
 
-    private func runSwitch(dest: String, port: Int, macs: [String], token: String) {
+    private func runSwitch(target: PeerTarget, macs: [String]) {
+        let dest = target.label
         func send(_ command: String, timeout: TimeInterval) -> Result<String, NetworkFailure> {
-            NetworkClient.send(host: dest, port: port, command: command, token: token, timeout: timeout)
+            NetworkClient.send(to: target, command: command, timeout: timeout)
         }
         let macList = macs.joined(separator: ",")
 
@@ -80,11 +137,7 @@ final class SwitchCoordinator: ObservableObject {
         case .success(let resp):
             guard let pong = PingReply(resp) else {
                 logger.error("ping rejected: \(resp)")
-                return fail(BTProtocol.describe(response: resp, localToken: token))
-            }
-            if pong.instanceID == AppInfo.instanceID {
-                logger.error("destination \(dest) is this Mac")
-                return fail("\(dest) is this Mac; enter the other Mac's address in Settings")
+                return fail(BTProtocol.describe(response: resp))
             }
             logger.info("ping ok: \(pong.name ?? dest)")
         }
@@ -114,7 +167,7 @@ final class SwitchCoordinator: ObservableObject {
             if let reports = PeripheralReport.decodeOK(resp) {
                 connectReports = reports
             } else {
-                connectProblem = BTProtocol.describe(response: resp, localToken: token)
+                connectProblem = BTProtocol.describe(response: resp)
             }
         }
 

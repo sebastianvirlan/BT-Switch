@@ -4,6 +4,7 @@ import Combine
 /// Menu bar icon. Left-click = switch. Right-click = menu (Settings, Quit, etc.).
 final class MenuBarController: NSObject {
     private let settings: AppSettings
+    private let pairing: PairingStore
     private let coordinator: SwitchCoordinator
     private let server: NetworkServer
     private let bluetooth: BluetoothController
@@ -21,12 +22,14 @@ final class MenuBarController: NSObject {
     private var snapshotInFlight = false
 
     init(settings: AppSettings,
+         pairing: PairingStore,
          coordinator: SwitchCoordinator,
          server: NetworkServer,
          bluetooth: BluetoothController,
          logger: AppLogger,
          openSettings: @escaping () -> Void) {
         self.settings = settings
+        self.pairing = pairing
         self.coordinator = coordinator
         self.server = server
         self.bluetooth = bluetooth
@@ -55,6 +58,11 @@ final class MenuBarController: NSObject {
             .store(in: &cancellables)
 
         // Peripheral list edits change the count immediately.
+        pairing.$peer
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateIcon() }
+            .store(in: &cancellables)
+
         settings.$peripheralsCSV
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
@@ -89,7 +97,7 @@ final class MenuBarController: NSObject {
             showRightClickMenu()
             return
         }
-        guard settings.isConfigured else {
+        guard isConfigured else {
             openSettings()
             return
         }
@@ -113,7 +121,7 @@ final class MenuBarController: NSObject {
             keyEquivalent: ""
         )
         switchItem.target = self
-        switchItem.isEnabled = !coordinator.isRunning && settings.isConfigured
+        switchItem.isEnabled = !coordinator.isRunning && isConfigured
         menu.addItem(switchItem)
 
         menu.addItem(.separator())
@@ -145,9 +153,12 @@ final class MenuBarController: NSObject {
         NSApp.terminate(nil)
     }
 
+    private var isConfigured: Bool {
+        pairing.current != nil && !settings.peripherals.isEmpty
+    }
+
     private func displayDestination() -> String {
-        let s = settings.destination.trimmingCharacters(in: .whitespaces)
-        return s.isEmpty ? "(unset)" : s
+        pairing.current?.name ?? "(not paired)"
     }
 
     private static let timeFormatter: DateFormatter = {
@@ -165,8 +176,10 @@ final class MenuBarController: NSObject {
             lines.append("⚠ Not listening: \(why)")
         }
         let total = settings.peripherals.count
-        if total == 0 {
-            lines.append("Not configured — open Settings")
+        if pairing.current == nil {
+            lines.append("Not paired with another Mac — open Settings")
+        } else if total == 0 {
+            lines.append("No peripherals configured — open Settings")
         } else if let here = connectedHere {
             lines.append("\(here) of \(total) peripherals here")
         } else {

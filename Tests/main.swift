@@ -20,7 +20,9 @@ func test(_ name: String, _ body: () -> Void) {
     print("\(failures == before ? "ok  " : "FAIL") \(name)")
 }
 
-let token = "0123456789abcdef0123456789abcdef"
+let key = Data((0..<32).map { UInt8($0) })
+let otherKey = Data(repeating: 0xff, count: 32)
+let senderID = "a1b2c3d4e5f6"
 let nonce = "00112233445566778899aabbccddeeff"
 let now = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -29,82 +31,99 @@ func authLine(_ request: String) -> (String, String) {
     return (lines[1], lines[2])
 }
 
+func keyFor(_ k: Data) -> (String) -> Data? { { $0 == senderID ? k : nil } }
+
+func signed(_ command: String, at t: Date = now) -> (String, String) {
+    authLine(BTProtocol.makeRequest(senderID: senderID, key: key, command: command, now: t, nonce: nonce))
+}
+
 // MARK: Framing
 
 test("framing waits for third newline") {
-    check(BTProtocol.extractRequestLines(Data("BT-SWITCH/2\nAUTH x\nCONN".utf8)) == nil,
+    check(BTProtocol.extractRequestLines(Data("BT-SWITCH/3\nAUTH x\nCONN".utf8)) == nil,
           "partial third line must not dispatch")
-    check(BTProtocol.extractRequestLines(Data("BT-SWITCH/2\nAUTH x".utf8)) == nil, "two lines")
+    check(BTProtocol.extractRequestLines(Data("BT-SWITCH/3\nAUTH x".utf8)) == nil, "two lines")
     check(BTProtocol.extractRequestLines(Data()) == nil, "empty")
 }
 
 test("framing returns complete lines, trims CRLF") {
-    let l = BTProtocol.extractRequestLines(Data("BT-SWITCH/2\r\nAUTH x\r\nCONNECT aa\r\n".utf8))
-    check(l == ["BT-SWITCH/2", "AUTH x", "CONNECT aa"], "got \(String(describing: l))")
+    let l = BTProtocol.extractRequestLines(Data("BT-SWITCH/3\r\nAUTH x\r\nCONNECT aa\r\n".utf8))
+    check(l == ["BT-SWITCH/3", "AUTH x", "CONNECT aa"], "got \(String(describing: l))")
 }
 
-test("framing ignores trailing data after third line") {
-    let l = BTProtocol.extractRequestLines(Data("a\nb\nc\nextra".utf8))
-    check(l == ["a", "b", "c"], "got \(String(describing: l))")
+test("framing returns leftover bytes after the lines") {
+    let r = BTProtocol.extractLines(Data("a\nb\nc\nREVEAL x\n".utf8), count: 3)
+    check(r?.0 == ["a", "b", "c"], "lines")
+    check(r.map { String(data: $0.1, encoding: .utf8) } == "REVEAL x\n", "leftover")
+    check(BTProtocol.extractLines(Data("one\n".utf8), count: 1)?.1.isEmpty == true, "no leftover")
 }
 
 // MARK: Auth
 
 test("signed request round-trips") {
-    let req = BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce)
-    check(req.hasPrefix("BT-SWITCH/2\n"), "version line")
-    check(!req.contains(token), "token must not appear on the wire")
+    let req = BTProtocol.makeRequest(senderID: senderID, key: key, command: "PING", now: now, nonce: nonce)
+    check(req.hasPrefix("BT-SWITCH/3\n"), "version line")
     let (auth, cmd) = authLine(req)
     check(cmd == "PING", "command")
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token, now: now,
-                            replayGuard: ReplayGuard()) == .ok, "valid request")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now,
+                            replayGuard: ReplayGuard()) == .ok(senderID: senderID), "valid request")
 }
 
-test("wrong token is rejected") {
-    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: "other", now: now,
-                            replayGuard: ReplayGuard()) == .badSignature, "wrong token")
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: "", now: now,
-                            replayGuard: ReplayGuard()) == .badSignature, "empty local token")
+test("unknown sender is not paired") {
+    let (auth, cmd) = signed("PING")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: { _ in nil }, now: now,
+                            replayGuard: ReplayGuard()) == .notPaired, "no key for sender")
 }
 
-test("tampered command is rejected") {
-    let (auth, _) = authLine(BTProtocol.makeRequest(token: token, command: "VERIFY aa:bb:cc:dd:ee:ff", now: now, nonce: nonce))
-    check(BTProtocol.verify(authLine: auth, command: "CONNECT aa:bb:cc:dd:ee:ff", token: token, now: now,
+test("wrong key is rejected") {
+    let (auth, cmd) = signed("PING")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(otherKey), now: now,
+                            replayGuard: ReplayGuard()) == .badSignature, "wrong key")
+}
+
+test("tampered command or sender is rejected") {
+    let (auth, _) = signed("VERIFY aa:bb:cc:dd:ee:ff")
+    check(BTProtocol.verify(authLine: auth, command: "CONNECT aa:bb:cc:dd:ee:ff", keyFor: keyFor(key), now: now,
                             replayGuard: ReplayGuard()) == .badSignature, "command swapped")
+    let swapped = auth.replacingOccurrences(of: senderID, with: "ffffffffffff")
+    check(BTProtocol.verify(authLine: swapped, command: "VERIFY aa:bb:cc:dd:ee:ff", keyFor: { _ in key }, now: now,
+                            replayGuard: ReplayGuard()) == .badSignature, "sender ID is covered by the MAC")
 }
 
 test("stale and future requests are rejected") {
-    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
+    let (auth, cmd) = signed("PING")
     let g = ReplayGuard()
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token,
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key),
                             now: now.addingTimeInterval(61), replayGuard: g) == .stale, "61s late")
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token,
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key),
                             now: now.addingTimeInterval(-61), replayGuard: g) == .stale, "61s early")
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token,
-                            now: now.addingTimeInterval(59), replayGuard: g) == .ok, "59s late is fine")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key),
+                            now: now.addingTimeInterval(59), replayGuard: g) == .ok(senderID: senderID), "59s late is fine")
 }
 
 test("replayed request is rejected") {
-    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
+    let (auth, cmd) = signed("PING")
     let g = ReplayGuard()
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token, now: now, replayGuard: g) == .ok, "first")
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token, now: now, replayGuard: g) == .replay, "second")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID), "first")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .replay, "second")
 }
 
 test("bad signature does not consume the nonce") {
-    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
+    let (auth, cmd) = signed("PING")
     let g = ReplayGuard()
-    _ = BTProtocol.verify(authLine: auth, command: cmd, token: "wrong", now: now, replayGuard: g)
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: token, now: now, replayGuard: g) == .ok,
+    _ = BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(otherKey), now: now, replayGuard: g)
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID),
           "nonce still usable after a forged attempt")
 }
 
 test("malformed auth lines") {
     let g = ReplayGuard()
-    for line in ["", "AUTH", "TOKEN \(token)", "AUTH 1 2 3", "AUTH abc \(nonce) \(String(repeating: "0", count: 64))",
-                 "AUTH 1 zz112233445566778899aabbccddeeff \(String(repeating: "0", count: 64))"] {
-        check(BTProtocol.verify(authLine: line, command: "PING", token: token, now: now, replayGuard: g) == .malformed,
+    let sig = String(repeating: "0", count: 64)
+    for line in ["", "AUTH", "TOKEN abc", "AUTH 1 2 3", "AUTH \(senderID) 1 2 3",
+                 "AUTH \(senderID) abc \(nonce) \(sig)",
+                 "AUTH \(senderID) 1 zz112233445566778899aabbccddeeff \(sig)",
+                 "AUTH 1 \(nonce) \(sig)"] {
+        check(BTProtocol.verify(authLine: line, command: "PING", keyFor: keyFor(key), now: now, replayGuard: g) == .malformed,
               "should be malformed: \(line)")
     }
 }
@@ -126,8 +145,11 @@ test("constant-time compare") {
 test("error descriptions") {
     check(BTProtocol.errorCode(in: "ERR busy") == "busy", "parse code")
     check(BTProtocol.errorCode(in: "OK pong") == nil, "not an error")
-    check(BTProtocol.describe(errorCode: "bad_token") == "token mismatch", "bad_token text")
+    check(BTProtocol.describe(errorCode: "not_paired").contains("pair them again"), "not_paired text")
+    check(BTProtocol.describe(errorCode: "bad_signature").contains("unpair"), "bad_signature text")
+    check(BTProtocol.describe(errorCode: "denied").contains("declined"), "denied text")
     check(BTProtocol.describe(errorCode: "weird").contains("weird"), "unknown code passes through")
+    check(BTProtocol.describe(response: "huh").contains("unexpected response"), "garbage")
 }
 
 // MARK: Port
@@ -216,53 +238,99 @@ test("switch lock is exclusive") {
     check(l.tryAcquire(), "reacquire")
 }
 
-// MARK: Token hygiene & fingerprints
+// MARK: Pairing
 
-test("token normalisation strips invisible whitespace") {
-    check(BTProtocol.normalizeToken(" \(token) \n") == token, "trailing space/newline")
-    check(BTProtocol.normalizeToken("0123456789ABCDEF\n0123456789abcdef") == token, "wrapped + uppercase")
-    check(BTProtocol.isValidToken(token), "valid")
-    check(!BTProtocol.isValidToken(token + "0"), "too long")
-    check(!BTProtocol.isValidToken("0123456789ABCDEF0123456789abcdef"), "uppercase is not normalised")
-    check(!BTProtocol.isValidToken("g123456789abcdef0123456789abcdef"), "non-hex")
+/// Runs both sides of the pairing exchange in-process.
+func simulatePairing(initiator i: Pairing.Ephemeral, responder r: Pairing.Ephemeral) -> (Pairing.Result?, Pairing.Result?) {
+    let ri = Pairing.derive(myKey: i, peerPublicKey: r.publicKey, initiatorID: "init", responderID: "resp",
+                            initiatorPub: i.publicKey, initiatorNonce: i.nonce,
+                            responderPub: r.publicKey, responderNonce: r.nonce)
+    let rr = Pairing.derive(myKey: r, peerPublicKey: i.publicKey, initiatorID: "init", responderID: "resp",
+                            initiatorPub: i.publicKey, initiatorNonce: i.nonce,
+                            responderPub: r.publicKey, responderNonce: r.nonce)
+    return (ri, rr)
 }
 
-test("normalised token signs identically") {
-    // The old false "token mismatch": one Mac stored a trailing space.
-    let (auth, cmd) = authLine(BTProtocol.makeRequest(token: token, command: "PING", now: now, nonce: nonce))
-    check(BTProtocol.verify(authLine: auth, command: cmd, token: BTProtocol.normalizeToken(token + " "),
-                            now: now, replayGuard: ReplayGuard()) == .ok, "normalised token verifies")
+test("both sides derive the same key and code") {
+    let (a, b) = simulatePairing(initiator: .init(), responder: .init())
+    check(a != nil && a == b, "key and code agree")
+    check(a?.key.count == 32, "32-byte key")
+    check(a.map { $0.code.count == 6 && $0.code.allSatisfy(\.isNumber) } == true, "6-digit code, got \(a?.code ?? "nil")")
+    let confirmI = Pairing.confirmation(key: a!.key, initiatorID: "init", responderID: "resp")
+    let confirmR = Pairing.confirmation(key: b!.key, initiatorID: "init", responderID: "resp")
+    check(confirmI == confirmR, "confirmation matches")
 }
 
-test("fingerprints") {
-    let fp = BTProtocol.fingerprint(token)
-    check(fp.count == 6 && fp.allSatisfy(\.isHexDigit), "6 hex chars, got \(fp)")
-    check(fp == BTProtocol.fingerprint(token), "stable")
-    check(fp != BTProtocol.fingerprint("ffffffffffffffffffffffffffffffff"), "differs")
-    check(BTProtocol.fingerprint("") == "none", "empty")
+test("a man in the middle produces different codes") {
+    // M runs separate exchanges with each side.
+    let i = Pairing.Ephemeral(), r = Pairing.Ephemeral(), m1 = Pairing.Ephemeral(), m2 = Pairing.Ephemeral()
+    let (iSide, _) = simulatePairing(initiator: i, responder: m1)
+    let (_, rSide) = simulatePairing(initiator: m2, responder: r)
+    check(iSide!.code != rSide!.code, "codes differ (1 in a million chance of a false failure)")
+    check(iSide!.key != rSide!.key, "keys differ")
 }
 
-test("bad_token reply says which side is wrong") {
-    let other = "ffffffffffffffffffffffffffffffff"
-    let ours = BTProtocol.fingerprint(token), theirs = BTProtocol.fingerprint(other)
+test("commitment binds the initiator's key") {
+    let i = Pairing.Ephemeral(), other = Pairing.Ephemeral()
+    let c = Pairing.commitment(publicKey: i.publicKey, nonce: i.nonce)
+    check(c.count == 64, "sha256 hex")
+    check(c == Pairing.commitment(publicKey: i.publicKey, nonce: i.nonce), "deterministic")
+    check(c != Pairing.commitment(publicKey: other.publicKey, nonce: i.nonce), "different key")
+    check(c != Pairing.commitment(publicKey: i.publicKey, nonce: other.nonce), "different nonce")
+}
 
-    let mismatch = BTProtocol.describe(response: "ERR bad_token \(theirs)", localToken: token)
-    check(mismatch.contains(ours) && mismatch.contains(theirs) && mismatch.contains("mismatch"), mismatch)
+test("invalid peer key is refused") {
+    let i = Pairing.Ephemeral()
+    check(Pairing.derive(myKey: i, peerPublicKey: Data([1, 2, 3]), initiatorID: "a", responderID: "b",
+                         initiatorPub: i.publicKey, initiatorNonce: i.nonce,
+                         responderPub: Data([1, 2, 3]), responderNonce: i.nonce) == nil, "short key")
+}
 
-    let same = BTProtocol.describe(response: "ERR bad_token \(ours)", localToken: token)
-    check(same.contains("tokens match") && same.contains("same BTSwitch build"), same)
+test("pairing messages round-trip") {
+    let e = Pairing.Ephemeral()
+    let hello = Pairing.PairHello(id: "abc123", name: "Sebastian’s MacBook Pro", commitment: String(repeating: "a", count: 64))
+    let parts = hello.lines.components(separatedBy: "\n")
+    check(Pairing.PairHello(line2: parts[0], line3: parts[1]) == hello, "hello, got \(hello.lines)")
 
-    let none = BTProtocol.describe(response: "ERR bad_token none", localToken: token)
-    check(none.contains("no token set"), none)
+    let key = Pairing.KeyMessage(id: "def456", name: "Studio Mac mini", publicKey: e.publicKey, nonce: e.nonce)
+    check(Pairing.KeyMessage(key.line) == key, "key message")
 
-    check(BTProtocol.describe(response: "ERR bad_token") == "token mismatch", "legacy reply without detail")
-    check(BTProtocol.describe(response: "huh").contains("unexpected response"), "garbage")
+    let reveal = Pairing.Reveal(publicKey: e.publicKey, nonce: e.nonce)
+    check(Pairing.Reveal(reveal.line) == reveal, "reveal")
+}
+
+test("pairing messages reject junk") {
+    check(Pairing.PairHello(line2: "PAIR abc", line3: "COMMIT x") == nil, "missing name")
+    check(Pairing.PairHello(line2: "PAIR a/b \(BTProtocol.encodeName("x"))", line3: "COMMIT \(String(repeating: "a", count: 64))") == nil, "bad id")
+    check(Pairing.PairHello(line2: "PAIR abc \(BTProtocol.encodeName("x"))", line3: "COMMIT abc") == nil, "short commit")
+    check(Pairing.KeyMessage("KEY abc eA== 00 00") == nil, "short key")
+    check(Pairing.Reveal("REVEAL zz 00") == nil, "bad hex")
+    check(Pairing.Reveal("ERR denied") == nil, "error")
+}
+
+test("names survive encoding, newlines flattened") {
+    check(BTProtocol.decodeName(BTProtocol.encodeName("Studio Mac\nmini")) == "Studio Mac mini", "flattened")
+    check(BTProtocol.decodeName(BTProtocol.encodeName("   ")) == nil, "blank")
+    check(BTProtocol.decodeName("!!!") == nil, "not base64")
+    check(BTProtocol.data(hex: "00ff10") == Data([0, 255, 16]), "hex decode")
+    check(BTProtocol.data(hex: "0") == nil && BTProtocol.data(hex: "zz") == nil, "bad hex")
+}
+
+test("code formatting") {
+    check(Pairing.formatCode("482913") == "482 913", "grouped")
+    check(Pairing.formatCode("12") == "12", "passthrough")
+}
+
+test("paired peer survives JSON round-trip") {
+    let p = PairedPeer(id: "abc", name: "Mac", key: key, address: "192.168.1.2", pairedAt: now)
+    let d = try! JSONEncoder().encode(p)
+    check((try? JSONDecoder().decode(PairedPeer.self, from: d)) == p, "round-trip")
 }
 
 test("error reply parsing") {
-    check(ErrorReply("ERR bad_token abc123") == ErrorReply("ERR bad_token abc123"), "equatable")
-    check(ErrorReply("ERR bad_token abc123")?.code == "bad_token", "code")
-    check(ErrorReply("ERR bad_token abc123")?.detail == "abc123", "detail")
+    check(ErrorReply("ERR bad_signature abc123") == ErrorReply("ERR bad_signature abc123"), "equatable")
+    check(ErrorReply("ERR bad_signature abc123")?.code == "bad_signature", "code")
+    check(ErrorReply("ERR bad_signature abc123")?.detail == "abc123", "detail")
     check(ErrorReply("ERR busy")?.detail == nil, "no detail")
     check(ErrorReply("OK pong") == nil, "not an error")
     check(ErrorReply("ERR ") == nil, "empty code")
@@ -289,13 +357,13 @@ test("ping reply accepts bare pong, rejects others") {
 // MARK: Network failures
 
 test("socket errors map to user-facing causes") {
-    check(NetworkFailure.from(posix: .ECONNREFUSED, host: "h", port: 1) == .refused(host: "h", port: 1), "refused")
-    check(NetworkFailure.from(posix: .EHOSTUNREACH, host: "h", port: 1) == .unreachable(host: "h"), "host unreach")
-    check(NetworkFailure.from(posix: .ENETUNREACH, host: "h", port: 1) == .unreachable(host: "h"), "net unreach")
-    check(NetworkFailure.from(posix: .ETIMEDOUT, host: "h", port: 1) == .connectTimeout(host: "h"), "timeout")
-    check(NetworkFailure.from(posix: .EPERM, host: "h", port: 1) == .localNetworkDenied, "privacy denial")
-    check(NetworkFailure.from(posix: .EINVAL, host: "h", port: 1) == nil, "no better explanation")
-    check("\(NetworkFailure.refused(host: "mac.local", port: 52525))".contains("isn't running"), "refused text")
+    check(NetworkFailure.from(posix: .ECONNREFUSED, host: "h") == .refused(host: "h"), "refused")
+    check(NetworkFailure.from(posix: .EHOSTUNREACH, host: "h") == .unreachable(host: "h"), "host unreach")
+    check(NetworkFailure.from(posix: .ENETUNREACH, host: "h") == .unreachable(host: "h"), "net unreach")
+    check(NetworkFailure.from(posix: .ETIMEDOUT, host: "h") == .connectTimeout(host: "h"), "timeout")
+    check(NetworkFailure.from(posix: .EPERM, host: "h") == .localNetworkDenied, "privacy denial")
+    check(NetworkFailure.from(posix: .EINVAL, host: "h") == nil, "no better explanation")
+    check("\(NetworkFailure.refused(host: "mac.local"))".contains("isn't running"), "refused text")
     check("\(NetworkFailure.localNetworkDenied)".contains("Local Network"), "denied text")
 }
 

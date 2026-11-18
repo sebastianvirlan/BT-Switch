@@ -24,41 +24,23 @@ enum AppInfo {
     }
 }
 
-/// User-configurable settings. Destination, peripherals and port live in
-/// UserDefaults; the shared token lives in the Keychain.
+/// User-configurable settings (peripherals, port), persisted in
+/// UserDefaults. The pairing with the other Mac lives in PairingStore.
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 
     private enum Keys {
-        static let destination = "destination"
         static let peripherals = "peripherals"   // comma-separated MAC addresses
-        static let token = "token"               // legacy (pre-Keychain) location only
         static let port = "port"
-    }
-
-    @Published var destination: String {
-        didSet { UserDefaults.standard.set(destination, forKey: Keys.destination) }
+        static let peripheralNames = "peripheralNames"
+        // Removed in v3 (replaced by pairing); cleaned up on launch.
+        static let legacyDestination = "destination"
+        static let legacyToken = "token"
     }
 
     /// Comma-separated MAC addresses, e.g. "10:94:BB:B9:73:74,0C:E4:41:21:A6:9B"
     @Published var peripheralsCSV: String {
         didSet { UserDefaults.standard.set(peripheralsCSV, forKey: Keys.peripherals) }
-    }
-
-    /// Always normalised: whitespace stripped, lowercase.
-    @Published var token: String {
-        didSet {
-            let normalized = BTProtocol.normalizeToken(token)
-            if normalized != token {
-                // Assigning inside didSet doesn't re-run didSet, so carry on
-                // and persist the clean value below.
-                token = normalized
-            }
-            guard token != oldValue else { return }
-            if !Keychain.writeToken(token) {
-                AppLogger.shared.error("could not save token to Keychain")
-            }
-        }
     }
 
     /// Always within 1...65535. Out-of-range input reverts to the previous value.
@@ -72,71 +54,78 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// Display names for selected peripherals, so they can still be listed
+    /// while they're paired with the other Mac (and so absent from this
+    /// Mac's Bluetooth list).
+    @Published private(set) var peripheralNames: [String: String] {
+        didSet { UserDefaults.standard.set(peripheralNames, forKey: Keys.peripheralNames) }
+    }
+
     /// Parsed, normalised list of valid MACs (lowercase, colon-separated).
     var peripherals: [String] { MAC.parseList(peripheralsCSV) }
 
-    var isConfigured: Bool {
-        !destination.trimmingCharacters(in: .whitespaces).isEmpty && !peripherals.isEmpty && !token.isEmpty
+    func isSelected(_ mac: String) -> Bool {
+        peripherals.contains(MAC.normalize(mac))
+    }
+
+    func setSelected(_ mac: String, _ selected: Bool, name: String?) {
+        let mac = MAC.normalize(mac)
+        var list = peripherals
+        if selected, !list.contains(mac) {
+            list.append(mac)
+        } else if !selected {
+            list.removeAll { $0 == mac }
+        }
+        peripheralsCSV = list.joined(separator: ",")
+        if selected, let name = name { peripheralNames[mac] = name }
+    }
+
+    /// Remembers names of devices that are currently visible.
+    func rememberNames(_ devices: [BluetoothController.PairedDevice]) {
+        var names = peripheralNames
+        for d in devices where isSelected(d.address) { names[d.address] = d.name }
+        if names != peripheralNames { peripheralNames = names }
+    }
+
+    /// Used when the other Mac sends peripherals and none are chosen here,
+    /// so they only have to be picked on one Mac.
+    func adoptPeripheralsIfNoneSelected(_ macs: [String]) -> Bool {
+        guard peripherals.isEmpty, !macs.isEmpty else { return false }
+        peripheralsCSV = macs.joined(separator: ",")
+        return true
     }
 
     private init() {
         Self.migrateLegacyDefaults()
+        Self.removeSharedToken()
         let d = UserDefaults.standard
-        self.destination = d.string(forKey: Keys.destination) ?? ""
         self.peripheralsCSV = d.string(forKey: Keys.peripherals) ?? ""
+        self.peripheralNames = (d.dictionary(forKey: Keys.peripheralNames) as? [String: String]) ?? [:]
 
         let savedPort = d.integer(forKey: Keys.port)
         // Sanitise here too: an out-of-range value saved by an older build
         // used to crash the app on every launch.
         self.port = BTProtocol.port(from: savedPort) != nil ? savedPort : BTProtocol.defaultPort
-
-        let stored = Self.loadTokenMigratingFromDefaults()
-        let clean = BTProtocol.normalizeToken(stored)
-        if clean != stored {
-            // Earlier builds saved pasted whitespace verbatim, which caused
-            // spurious "token mismatch" errors.
-            Keychain.writeToken(clean)
-        }
-        self.token = clean
     }
 
-    var tokenFingerprint: String { BTProtocol.fingerprint(token) }
-
-    /// Reads the token from the Keychain, moving it out of UserDefaults
-    /// (current or legacy domain) the first time.
-    private static func loadTokenMigratingFromDefaults() -> String {
-        if let t = Keychain.readToken(), !t.isEmpty { return t }
-        let domains = [UserDefaults.standard, UserDefaults(suiteName: AppInfo.legacyBundleID)].compactMap { $0 }
-        for d in domains {
-            if let t = d.string(forKey: Keys.token), !t.isEmpty {
-                if Keychain.writeToken(t) {
-                    d.removeObject(forKey: Keys.token)
-                }
-                return t
-            }
-        }
-        return ""
-    }
-
-    /// Copies destination/peripherals/port from the old bundle ID's
-    /// preferences if this bundle ID has none yet.
+    /// Copies peripherals/port from the old bundle ID's preferences if this
+    /// bundle ID has none yet.
     private static func migrateLegacyDefaults() {
         guard AppInfo.bundleID != AppInfo.legacyBundleID,
               let legacy = UserDefaults(suiteName: AppInfo.legacyBundleID) else { return }
         let current = UserDefaults.standard
-        for key in [Keys.destination, Keys.peripherals, Keys.port]
-        where current.object(forKey: key) == nil {
+        for key in [Keys.peripherals, Keys.port] where current.object(forKey: key) == nil {
             if let v = legacy.object(forKey: key) { current.set(v, forKey: key) }
         }
     }
 
-    static func generateToken() -> String {
-        var bytes = [UInt8](repeating: 0, count: 16)
-        let result = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard result == errSecSuccess else {
-            // Fallback to a less-cryptographic source. Should never happen.
-            return UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    /// v3 replaced the shared token and typed destination with pairing.
+    /// Delete the old secret wherever earlier builds kept it.
+    private static func removeSharedToken() {
+        Keychain.delete(account: "shared-token")
+        for d in [UserDefaults.standard, UserDefaults(suiteName: AppInfo.legacyBundleID)].compactMap({ $0 }) {
+            d.removeObject(forKey: Keys.legacyToken)
+            d.removeObject(forKey: Keys.legacyDestination)
         }
-        return BTProtocol.hex(bytes)
     }
 }

@@ -1,7 +1,8 @@
 import Foundation
 import Network
 
-/// TCP listener implementing the BT-SWITCH/2 protocol (see Protocol.swift).
+/// TCP listener implementing the BT-SWITCH/3 protocol (see Protocol.swift),
+/// advertised on the local network via Bonjour.
 final class NetworkServer: ObservableObject {
     enum ListenerState: Equatable {
         case starting
@@ -13,20 +14,41 @@ final class NetworkServer: ObservableObject {
     /// when this Mac isn't actually reachable.
     @Published private(set) var state: ListenerState = .starting
 
+    struct PairingRequest {
+        let name: String
+        let address: String
+        let code: String
+        /// Name of the Mac this would replace, if already paired elsewhere.
+        let replacing: String?
+    }
+
+    /// Asks the user to approve a pairing request. Called on any queue;
+    /// must eventually call `decide` (from any queue) unless dismissed.
+    /// Returns a closure that dismisses the prompt, used when the requester
+    /// gives up or the request times out.
+    var requestApproval: ((_ request: PairingRequest, _ decide: @escaping (Bool) -> Void) -> () -> Void)?
+
     private let settings: AppSettings
     private let bluetooth: BluetoothController
     private let logger: AppLogger
     private let switchLock: SwitchLock
+    private let pairing: PairingStore
     private let replayGuard = ReplayGuard()
     private var listener: NWListener?
+    /// Connection handling, including all pairing state, runs on this queue.
     private let acceptQueue = DispatchQueue(label: "\(AppInfo.bundleID).server.accept")
     private let workQueue = DispatchQueue(label: "\(AppInfo.bundleID).server.work", qos: .userInitiated)
+    private var pairingInProgress = false   // acceptQueue only
 
-    init(settings: AppSettings, bluetooth: BluetoothController, logger: AppLogger, switchLock: SwitchLock) {
+    static let approvalTimeout: TimeInterval = 60
+
+    init(settings: AppSettings, bluetooth: BluetoothController, logger: AppLogger,
+         switchLock: SwitchLock, pairing: PairingStore) {
         self.settings = settings
         self.bluetooth = bluetooth
         self.logger = logger
         self.switchLock = switchLock
+        self.pairing = pairing
     }
 
     func start() {
@@ -43,6 +65,12 @@ final class NetworkServer: ObservableObject {
             fail(Self.describe(listenerError: error, port: portNumber))
             return
         }
+
+        // Advertise so the other Mac can find this one by name.
+        let name = AppInfo.computerName
+        let txt = NWTXTRecord(["id": AppInfo.instanceID, "name": name])
+        l.service = NWListener.Service(name: name, type: BTProtocol.bonjourType, domain: nil, txtRecord: txt)
+
         l.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
             switch state {
@@ -93,18 +121,24 @@ final class NetworkServer: ObservableObject {
     // MARK: - Connection handling
 
     private func handle(connection conn: NWConnection) {
+        conn.start(queue: acceptQueue)
         guard Self.isLocalPeer(conn.endpoint) else {
             logger.warn("rejected connection from non-local address \(Self.peer(conn))")
-            conn.start(queue: acceptQueue)
             respond(conn: conn, "ERR forbidden_peer\n")
             return
         }
-        conn.start(queue: acceptQueue)
         receiveRequest(conn: conn)
     }
 
     private static func peer(_ conn: NWConnection) -> String {
-        if case .hostPort(let host, _) = conn.endpoint { return "\(host)" }
+        if case .hostPort(let host, _) = conn.endpoint {
+            switch host {
+            case .ipv4(let a): return "\(a)"
+            case .ipv6(let a): return "\(a)"
+            case .name(let n, _): return n
+            @unknown default: return "\(host)"
+            }
+        }
         return "\(conn.endpoint)"
     }
 
@@ -131,8 +165,8 @@ final class NetworkServer: ObservableObject {
             var buf = accumulated
             if let d = data { buf.append(d) }
 
-            if let lines = BTProtocol.extractRequestLines(buf) {
-                self.dispatch(conn: conn, version: lines[0], auth: lines[1], command: lines[2])
+            if let (lines, rest) = BTProtocol.extractLines(buf, count: 3) {
+                self.dispatch(conn: conn, version: lines[0], line2: lines[1], line3: lines[2], leftover: rest)
                 return
             }
             if isComplete {
@@ -149,11 +183,11 @@ final class NetworkServer: ObservableObject {
         }
     }
 
-    private func dispatch(conn: NWConnection, version: String, auth: String, command: String) {
+    private func dispatch(conn: NWConnection, version: String, line2: String, line3: String, leftover: Data) {
         let from = Self.peer(conn)
         if version != BTProtocol.version {
             if BTProtocol.legacyVersions.contains(version) {
-                logger.warn("rejected \(from): it uses old protocol \(version); update BTSwitch on that Mac")
+                logger.warn("rejected \(from): it runs an older BTSwitch (\(version)); update that Mac")
                 respond(conn: conn, "ERR upgrade_required\n")
             } else {
                 logger.warn("rejected \(from): unrecognised protocol line")
@@ -162,41 +196,60 @@ final class NetworkServer: ObservableObject {
             return
         }
 
-        let token = settings.token
-        let authResult = BTProtocol.verify(authLine: auth, command: command,
-                                           token: token, replayGuard: replayGuard)
-        switch authResult {
-        case .ok:
-            break
-        case .badSignature:
-            let fp = BTProtocol.fingerprint(token)
-            logger.warn("rejected \(from): token mismatch (this Mac's token fingerprint is \(fp))")
-            respond(conn: conn, "ERR bad_token \(fp)\n")
-            return
-        case .stale:
-            logger.warn("rejected \(from): timestamp off by more than \(Int(BTProtocol.maxClockSkew))s; check both clocks")
-            respond(conn: conn, "ERR \(authResult.errorCode)\n")
-            return
-        default:
-            logger.warn("rejected \(from): \(authResult.errorCode)")
-            respond(conn: conn, "ERR \(authResult.errorCode)\n")
+        if line2.hasPrefix("PAIR ") {
+            guard let hello = Pairing.PairHello(line2: line2, line3: line3) else {
+                logger.warn("rejected \(from): malformed pairing request")
+                respond(conn: conn, "ERR bad_pairing\n")
+                return
+            }
+            handlePairing(conn: conn, hello: hello, from: from, leftover: leftover)
             return
         }
 
-        switch command {
+        let auth = BTProtocol.verify(authLine: line2, command: line3,
+                                     keyFor: { [pairing] in pairing.key(for: $0) },
+                                     replayGuard: replayGuard)
+        let sender: String
+        switch auth {
+        case .ok(let id):
+            sender = id
+        case .notPaired:
+            logger.warn("rejected \(from): not paired with this Mac")
+            respond(conn: conn, "ERR not_paired\n")
+            return
+        case .stale:
+            logger.warn("rejected \(from): timestamp off by more than \(Int(BTProtocol.maxClockSkew))s; check both clocks")
+            respond(conn: conn, "ERR \(auth.errorCode)\n")
+            return
+        default:
+            logger.warn("rejected \(from): \(auth.errorCode)")
+            respond(conn: conn, "ERR \(auth.errorCode)\n")
+            return
+        }
+
+        // Remember where the paired Mac is, in case Bonjour can't see it later.
+        pairing.updateAddress(from, for: sender)
+        let peerName = pairing.current?.name ?? from
+
+        switch line3 {
         case "PING":
             if switchLock.isHeld {
-                logger.info("ping from \(from) while busy")
+                logger.info("ping from \(peerName) while busy")
                 respond(conn: conn, "ERR busy\n")
             } else {
-                logger.info("ping from \(from)")
+                logger.info("ping from \(peerName)")
                 let reply = PingReply(instanceID: AppInfo.instanceID, name: AppInfo.computerName)
                 respond(conn: conn, reply.encoded + "\n")
             }
 
+        case "UNPAIR":
+            logger.info("\(peerName) unpaired from this Mac")
+            pairing.clear()
+            respond(conn: conn, "OK unpaired\n")
+
         case let s where s.hasPrefix("VERIFY "):
             let macs = MAC.parseList(String(s.dropFirst("VERIFY ".count)))
-            logger.info("verify from \(from): \(macs)")
+            logger.info("verify from \(peerName): \(macs)")
             workQueue.async { [weak self] in
                 guard let self = self else { return }
                 let reports = macs.map { PeripheralReport(mac: $0, connected: self.bluetooth.isConnected($0)) }
@@ -206,11 +259,16 @@ final class NetworkServer: ObservableObject {
         case let s where s.hasPrefix("CONNECT "):
             let macs = MAC.parseList(String(s.dropFirst("CONNECT ".count)))
             guard switchLock.tryAcquire() else {
-                logger.warn("connect from \(from) rejected: a switch is already running on this Mac")
+                logger.warn("connect from \(peerName) rejected: a switch is already running on this Mac")
                 respond(conn: conn, "ERR busy\n")
                 return
             }
-            logger.info("connect from \(from): \(macs)")
+            logger.info("connect from \(peerName): \(macs)")
+            DispatchQueue.main.async { [settings, logger] in
+                if settings.adoptPeripheralsIfNoneSelected(macs) {
+                    logger.info("using the same \(macs.count) peripheral(s) as \(peerName) for switching back")
+                }
+            }
             workQueue.async { [weak self] in
                 guard let self = self else { return }
                 defer { self.switchLock.release() }
@@ -218,10 +276,105 @@ final class NetworkServer: ObservableObject {
             }
 
         default:
-            logger.warn("rejected \(from): unknown command")
+            logger.warn("rejected \(peerName): unknown command")
             respond(conn: conn, "ERR bad_command\n")
         }
     }
+
+    // MARK: - Pairing (responder side; runs on acceptQueue)
+
+    private func handlePairing(conn: NWConnection, hello: Pairing.PairHello, from: String, leftover: Data) {
+        guard !pairingInProgress, !switchLock.isHeld, let requestApproval = requestApproval else {
+            logger.warn("pairing request from \(hello.name) (\(from)) rejected: busy")
+            respond(conn: conn, "ERR busy\n")
+            return
+        }
+        guard hello.id != AppInfo.instanceID else {
+            respond(conn: conn, "ERR bad_pairing\n")
+            return
+        }
+        pairingInProgress = true
+        logger.info("pairing request from \(hello.name) (\(from))")
+
+        let mine = Pairing.Ephemeral()
+        let channel = LineChannel(connection: conn, label: hello.name, queue: acceptQueue, buffer: leftover)
+        channel.send(Pairing.KeyMessage(id: AppInfo.instanceID, name: AppInfo.computerName,
+                                        publicKey: mine.publicKey, nonce: mine.nonce).line)
+
+        channel.readLine(timeout: 15) { [weak self] r in
+            guard let self = self else { return }
+            guard case .success(let line) = r, let reveal = Pairing.Reveal(line) else {
+                return self.abandonPairing(conn: conn, name: hello.name, reason: "no valid key from the other Mac")
+            }
+            // The initiator committed to this key before seeing ours; if it
+            // doesn't match, someone tried to steer the code.
+            guard Pairing.commitment(publicKey: reveal.publicKey, nonce: reveal.nonce) == hello.commitment else {
+                return self.abandonPairing(conn: conn, name: hello.name, reason: "key didn't match its commitment")
+            }
+            guard let result = Pairing.derive(
+                myKey: mine, peerPublicKey: reveal.publicKey,
+                initiatorID: hello.id, responderID: AppInfo.instanceID,
+                initiatorPub: reveal.publicKey, initiatorNonce: reveal.nonce,
+                responderPub: mine.publicKey, responderNonce: mine.nonce)
+            else { return self.abandonPairing(conn: conn, name: hello.name, reason: "invalid key") }
+
+            self.askUser(conn: conn, channel: channel, hello: hello, from: from,
+                         result: result, requestApproval: requestApproval)
+        }
+    }
+
+    private func abandonPairing(conn: NWConnection, name: String, reason: String) {
+        logger.warn("pairing with \(name) failed: \(reason)")
+        pairingInProgress = false
+        respond(conn: conn, "ERR bad_pairing\n")
+    }
+
+    private func askUser(conn: NWConnection, channel: LineChannel, hello: Pairing.PairHello, from: String,
+                         result: Pairing.Result,
+                         requestApproval: (PairingRequest, @escaping (Bool) -> Void) -> () -> Void) {
+        let existing = pairing.current
+        let request = PairingRequest(
+            name: hello.name, address: from, code: result.code,
+            replacing: existing.flatMap { $0.id == hello.id ? nil : $0.name })
+
+        // All of the following runs on acceptQueue, so no locking needed.
+        var decided = false
+        var dismiss: () -> Void = {}
+
+        let conclude: (_ outcome: String) -> Void = { [weak self] outcome in
+            guard let self = self, !decided else { return }
+            decided = true
+            dismiss()
+            self.pairingInProgress = false
+            switch outcome {
+            case "allowed":
+                self.pairing.save(PairedPeer(id: hello.id, name: hello.name, key: result.key,
+                                             address: from, pairedAt: Date()))
+                self.logger.info("paired with \(hello.name)")
+                let confirm = Pairing.confirmation(key: result.key, initiatorID: hello.id,
+                                                   responderID: AppInfo.instanceID)
+                self.respond(conn: conn, "OK \(confirm)\n")
+            case "cancelled":
+                self.logger.info("pairing request from \(hello.name) was cancelled")
+                conn.cancel()
+            case "timed out":
+                self.logger.info("pairing request from \(hello.name) timed out")
+                self.respond(conn: conn, "ERR timeout\n")
+            default:
+                self.logger.info("pairing request from \(hello.name) denied")
+                self.respond(conn: conn, "ERR denied\n")
+            }
+        }
+
+        dismiss = requestApproval(request) { [acceptQueue] allowed in
+            acceptQueue.async { conclude(allowed ? "allowed" : "denied") }
+        }
+        acceptQueue.asyncAfter(deadline: .now() + Self.approvalTimeout) { conclude("timed out") }
+        // If the requester cancels, take the prompt down.
+        channel.watchForClose { [acceptQueue] in acceptQueue.async { conclude("cancelled") } }
+    }
+
+    // MARK: - Commands
 
     private func handleConnect(conn: NWConnection, macs: [String]) {
         var reports: [PeripheralReport] = []

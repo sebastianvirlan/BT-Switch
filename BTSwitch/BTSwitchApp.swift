@@ -16,25 +16,33 @@ struct BTSwitchApp: App {
 final class BTServices {
     static let shared = BTServices()
     let bluetooth: BluetoothController
+    let directory: PeerDirectory
+    let pairingController: PairingController
     let coordinator: SwitchCoordinator
     let server: NetworkServer
 
     private init() {
+        let logger = AppLogger.shared
         let bt = BluetoothController()
         // Shared so a local switch and an incoming CONNECT never overlap.
         let lock = SwitchLock()
         self.bluetooth = bt
+        self.directory = PeerDirectory(logger: logger)
+        self.pairingController = PairingController(store: PairingStore.shared, logger: logger)
         self.coordinator = SwitchCoordinator(
             settings: AppSettings.shared,
+            pairing: PairingStore.shared,
+            directory: directory,
             bluetooth: bt,
-            logger: AppLogger.shared,
+            logger: logger,
             switchLock: lock
         )
         self.server = NetworkServer(
             settings: AppSettings.shared,
             bluetooth: bt,
-            logger: AppLogger.shared,
-            switchLock: lock
+            logger: logger,
+            switchLock: lock,
+            pairing: PairingStore.shared
         )
     }
 }
@@ -52,15 +60,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard resolveOtherInstances() else { return }
 
-        if settings.token.isEmpty {
-            settings.token = AppSettings.generateToken()
-            logger.info("generated new token")
+        services.server.requestApproval = { request, decide in
+            PairingPrompt.show(request, decide: decide)
         }
-
         services.server.start()
+        services.directory.start()
 
         menuBar = MenuBarController(
             settings: settings,
+            pairing: PairingStore.shared,
             coordinator: services.coordinator,
             server: services.server,
             bluetooth: services.bluetooth,
@@ -71,8 +79,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Only one copy can hold the listener port; a second one would sit in
-    /// the menu bar unreachable while the first answers requests with
-    /// whatever token it loaded at launch. Returns false if this copy is
+    /// the menu bar unreachable while the first answers every request.
+    /// Returns false if this copy is
     /// quitting.
     private func resolveOtherInstances() -> Bool {
         let me = ProcessInfo.processInfo.processIdentifier
@@ -135,13 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .environmentObject(AppLogger.shared)
             .environmentObject(BTServices.shared.coordinator)
             .environmentObject(BTServices.shared.server)
-            .frame(width: 540, height: 580)
+            .environmentObject(BTServices.shared.directory)
+            .environmentObject(BTServices.shared.pairingController)
+            .environmentObject(PairingStore.shared)
+            .frame(width: 560, height: 640)
 
         let host = NSHostingController(rootView: view)
         let window = NSWindow(contentViewController: host)
         window.title = "BTSwitch Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 540, height: 580))
+        window.setContentSize(NSSize(width: 560, height: 640))
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self

@@ -27,13 +27,14 @@ BTSwitch uses the same Bluetooth approach as Blue Switch (`IOBluetoothDevicePair
 
 ## How it works
 
-You install BTSwitch on both Macs. Each app:
+You install BTSwitch on both Macs and pair them once. Each app:
 
-- Listens on a local TCP port for switch requests from the other Mac
-- When clicked, removes the configured peripherals from its own Bluetooth database, then asks the other Mac (over the network) to re-pair and connect them
-- Authenticates each request with a shared token you configure once
+- Announces itself on the local network (Bonjour), so the other Mac can find it by name
+- Listens on a local TCP port for switch requests from the paired Mac
+- When clicked, removes the configured peripherals from its own Bluetooth database, then asks the paired Mac (over the network) to re-pair and connect them
+- Signs every request with a key the two Macs agreed during pairing
 
-Click the icon on Mac A, peripherals move to Mac B. Click on Mac B, peripherals move back. Each Mac is configured with the other Mac's address and the list of peripherals to switch.
+Click the icon on Mac A, peripherals move to Mac B. Click on Mac B, peripherals move back.
 
 ## Requirements
 
@@ -74,57 +75,41 @@ Build with Cmd+B.
 
 ## First-time setup
 
-Do these steps on **both** Macs.
+### 1. Launch and grant permissions (both Macs)
 
-### 1. Launch and grant permissions
+Open BTSwitch from `/Applications` on **both** Macs. macOS will prompt for:
 
-Open BTSwitch from `/Applications`. macOS will prompt for:
-
-- **Bluetooth permission** — required to switch peripherals
-- **Local Network permission** — required so the two Macs can talk
+- **Bluetooth permission**: required to switch peripherals
+- **Local Network permission**: required so the two Macs can find and talk to each other
 
 Grant both. If you accidentally denied either, enable them under
 System Settings → Privacy & Security. If BTSwitch isn't listed there, delete and reinstall the app.
 
-### 2. Open Settings
+### 2. Pair the two Macs
 
-A keyboard icon appears in the menu bar. Right-click it and choose **Settings…**
+On either Mac, click the keyboard icon in the menu bar (or right-click it → **Settings…**) and open the **Pairing** tab. The other Mac appears in the list by name; click **Pair**.
 
-![Settings — General tab](docs/screenshots/settings-general.jpg)
+The other Mac then shows a prompt like this:
 
-### 3. Configure each Mac
+> **"Sebastian's MacBook Pro" wants to pair with BTSwitch**
+> **482 913**
+> [Allow] [Deny]
 
-In the **General** tab, fill in:
+Check that the code matches the one shown on the first Mac, then click **Allow** (or press Return). Both Macs now show "Paired". You only do this once.
 
-- **Destination Mac**: the IP address or hostname of the *other* Mac (use IP for reliability)
-- **Peripherals**: comma-separated MAC addresses of the keyboard, mouse, etc.
+- **The other Mac isn't listed?** Open "Not listed? Pair by address" and type its IP address (`ipconfig getifaddr en0`). Both Macs must use the same listener port.
+- **Codes don't match?** Click **Deny**. Something on the network interfered with the exchange.
+- **The other Mac has no keyboard or mouse of its own?** Plug the Magic Keyboard into it with its USB cable; it works over the cable immediately, so you can press Return to approve.
 
-To find a Mac's IP:
+### 3. Choose the peripherals
 
-```bash
-ipconfig getifaddr en0    # Wi-Fi
-ipconfig getifaddr en1    # often Ethernet/dock
-```
+In the **General** tab, tick the keyboard, mouse and trackpad you want to switch. The list shows the Bluetooth devices paired with this Mac; peripherals you've already chosen stay listed even while they're on the other Mac.
 
-To find a peripheral's Bluetooth address:
+You only need to do this on one Mac: the first time you switch, the other Mac adopts the same list.
 
-```bash
-system_profiler SPBluetoothDataType | grep -A 3 -i "magic"
-```
+### 4. Test
 
-### 4. Sync the token
-
-In the **Token** tab, BTSwitch generates a 32-character secret on first launch. Both Macs need the **same** token.
-
-![Settings — Token tab](docs/screenshots/settings-token.jpg)
-
-On the first Mac, click **Copy**. On the second Mac, paste the token into the Token field. Order doesn't matter — pick either Mac's token and use it on both.
-
-### 5. Test the link
-
-Back in the **General** tab, click **Test Connection**. You should see a green check with the other Mac's name, for example "✓ reachable: Studio Mac mini, tokens match".
-
-If you see a red error, it names the cause: BTSwitch not running there, no route to the address, Local Network permission blocked, a token mismatch, and so on. The General tab also shows whether *this* Mac is listening.
+In the **Pairing** tab, click **Test Connection**. You should see "Studio Mac mini is reachable and paired". If you see a red error, it names the cause: BTSwitch not running there, no route, Local Network permission blocked, not paired, and so on. The General tab also shows whether *this* Mac is listening.
 
 ## Usage
 
@@ -132,7 +117,7 @@ If you see a red error, it names the cause: BTSwitch not running there, no route
 
 **Right-click** for the menu:
 
-- *Switch peripherals to {destination}* — same as left-click
+- *Switch peripherals to {paired Mac}* — same as left-click
 - *Settings…* — open the configuration window
 - *Quit*
 
@@ -147,27 +132,29 @@ The icon reflects current state:
 
 ## Troubleshooting
 
-### "Last switch failed: can't reach …"
+### "can't find … on the network"
 
-The other Mac's BTSwitch isn't responding. Make sure it's running, the IP is correct, and your firewall allows TCP on the listener port (default 52525).
+The paired Mac isn't visible via Bonjour and has no known address yet. Make sure it's awake, on the same network and running BTSwitch. If your network blocks Bonjour, pair by address instead.
+
+### "… refused the connection" / "no route to …"
+
+The other Mac's BTSwitch isn't running, it's asleep, or a firewall blocks TCP on the listener port (default 52525).
 
 ### "asleep or out of range"
 
 The peripheral isn't responding to wake signals. Press a key or click the mouse to wake it, then try again.
 
-### Token mismatch
+### "not paired" / "the pairing keys don't match"
 
-Both Macs must use the same token. Open Settings → Token on each Mac and compare the **fingerprints** (a 6-character code). If they differ, copy the token from one Mac and paste it on the other. Spaces and line breaks picked up while pasting are stripped automatically.
+The other Mac has forgotten this one (it was unpaired, or paired with a different Mac), or the two have different keys. Open Settings → Pairing and pair them again.
 
-The error message shows both fingerprints ("this Mac a3f9c1, other Mac 7be204"), so you can tell which Mac has the wrong token. If it says the tokens match but the request was still rejected, the two Macs are running different BTSwitch builds.
+### "pairing was declined" / "nobody approved the pairing"
+
+The other Mac's user clicked **Deny**, or didn't answer within 60 seconds. Start pairing again and click **Allow** on the other Mac.
 
 ### "Not listening: port 52525 is already in use"
 
 Another program, usually a second copy of BTSwitch, holds the port. BTSwitch offers to quit another running copy at launch. If something else uses the port, pick a different port on **both** Macs.
-
-### "… is this Mac"
-
-The destination address points back at the Mac you're on. Enter the *other* Mac's address.
 
 ### "macOS blocked the connection"
 
@@ -179,15 +166,15 @@ Requests are timestamped to prevent replay, so both Macs' clocks must be within 
 
 ### "the other Mac runs an older/newer BTSwitch"
 
-Version 2 changed the network protocol. Update BTSwitch on both Macs.
+The network protocol changed (version 3 introduced pairing). Update BTSwitch on both Macs.
 
 ### Keychain prompt after rebuilding
 
-The token is stored in your Keychain. Because `build.sh` ad-hoc signs the app, each rebuild looks like a new app to the Keychain, and macOS asks whether BTSwitch may read the token. Click **Always Allow**.
+The pairing key is stored in your Keychain. Because `build.sh` ad-hoc signs the app, each rebuild looks like a new app to the Keychain, and macOS asks whether BTSwitch may read it. Click **Always Allow**.
 
 ### Menu bar icon does nothing on click
 
-If you haven't configured a destination/peripherals/token yet, left-click opens Settings instead of switching. Fill in the General and Token tabs first.
+If this Mac isn't paired yet or has no peripherals configured, left-click opens Settings instead of switching.
 
 ### Peripheral connects then jumps back to the other Mac
 
@@ -205,27 +192,24 @@ Settings → **Log** tab shows everything BTSwitch has done. Click **Copy All** 
 
 ## Security
 
-- BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses (private IPv4 ranges, link-local, IPv6 unique-local, loopback, and 100.64.0.0/10 for Tailscale-style VPNs).
-- Every request is signed with HMAC-SHA256 using the shared token. The token itself never crosses the network.
-- Each request carries a timestamp and a one-time nonce, so a captured request can't be replayed.
-- The token is stored in the macOS Keychain. Earlier versions kept it in UserDefaults; it's moved to the Keychain automatically on first launch.
-- No outbound traffic except to the destination you configure.
+- **Pairing:** the two Macs agree a key with an X25519 key exchange. Both screens show a 6-digit code derived from the exchange, and the receiving Mac's user must click **Allow**. The requesting Mac commits to its key before seeing the other's, so nobody in the middle can make the codes match; an interception shows up as different codes.
+- **Requests:** every request is signed with HMAC-SHA256 using that key, and carries a timestamp and a one-time nonce, so requests can't be forged or replayed. The key never crosses the network.
+- **Storage:** the pairing key is stored in the macOS Keychain. The shared token used by earlier versions is deleted on first launch.
+- **Unpairing:** clicking **Unpair** on either Mac makes both forget each other. If the other Mac is unreachable at that moment, it keeps its record until it next contacts this Mac and is told it isn't paired.
+- **Network exposure:** BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses (private IPv4 ranges, link-local, IPv6 unique-local, loopback, and 100.64.0.0/10 for Tailscale-style VPNs). It advertises its computer name via Bonjour on the local network.
 - No telemetry, no analytics, no network calls outside the LAN.
 - Traffic is not encrypted. Anyone on your network can see which commands are sent and which peripheral addresses are involved, but can't forge or replay them.
 - Removing a peripheral relies on a private IOBluetooth method. If a macOS update removes it, BTSwitch logs a warning instead of silently claiming success.
 
 ## Configuration reference
 
-All settings are in the Settings window:
+| Setting | Where | Description | Default |
+|---|---|---|---|
+| Paired Mac | Pairing tab | The other Mac, chosen from the network or by address | (none) |
+| Peripherals | General tab | Keyboard, mouse, trackpad to switch, ticked from this Mac's Bluetooth devices | (none; adopted from the other Mac on first switch) |
+| Listener Port | General tab | TCP port BTSwitch listens on (must match on both Macs when pairing by address) | 52525 |
 
-| Setting | Description | Default |
-|---|---|---|
-| Destination Mac | IP or hostname of the other Mac | (empty) |
-| Peripherals | Comma-separated Bluetooth MACs | (empty) |
-| Listener Port | TCP port BTSwitch listens on | 52525 |
-| Token | Shared secret (must match on both Macs) | (auto-generated) |
-
-Settings persist across app restarts via UserDefaults.
+Peripherals and port are stored in UserDefaults; the pairing is stored in the Keychain.
 
 ## Building from source
 
@@ -237,12 +221,16 @@ BTSwitch/
 │   ├── BTSwitchApp.swift          App entry, window management
 │   ├── MenuBarController.swift    Menu bar icon and click handling
 │   ├── AppSettings.swift          User-configurable settings
-│   ├── Keychain.swift             Token storage
-│   ├── Protocol.swift             Wire protocol, auth, parsing (pure, unit-tested)
+│   ├── Keychain.swift             Keychain access
+│   ├── PairingStore.swift         The paired Mac and its key
+│   ├── PairingController.swift    Pairing, requesting side
+│   ├── PairingPrompt.swift        The Allow/Deny prompt, receiving side
+│   ├── PeerDirectory.swift        Bonjour discovery
+│   ├── Protocol.swift             Wire protocol, auth, pairing crypto (pure, unit-tested)
 │   ├── SettingsView.swift         Settings UI
 │   ├── SwitchCoordinator.swift    Orchestrates a switch
 │   ├── BluetoothController.swift  Bluetooth pair/connect/remove
-│   ├── NetworkServer.swift        TCP listener
+│   ├── NetworkServer.swift        TCP listener and Bonjour advertisement
 │   ├── NetworkClient.swift        TCP sender
 │   ├── Logger.swift               In-app log buffer
 │   ├── AppIcon.icns               App icon (generated by scripts/make-icon.swift)
@@ -264,10 +252,10 @@ Run the unit tests with:
 ./test.sh
 ```
 
-### Upgrading from 1.x
+### Upgrading
 
-- The protocol changed to `BT-SWITCH/2`. Update **both** Macs.
-- The bundle ID changed from `com.user.btswitch` to `io.github.sebastianvirlan.btswitch`. Your destination, peripherals, port and token are migrated automatically, but macOS treats it as a new app, so you'll be asked for Bluetooth and Local Network permission again.
+- **To 3.x:** the shared token is gone; pair the Macs instead (see First-time setup). The protocol is now `BT-SWITCH/3`, so update **both** Macs. Your peripherals and port are kept; the old token and destination address are deleted.
+- **From 1.x:** the bundle ID changed from `com.user.btswitch` to `io.github.sebastianvirlan.btswitch`. Peripherals and port are migrated automatically, but macOS treats it as a new app, so you'll be asked for Bluetooth and Local Network permission again.
 
 ## Contributing
 

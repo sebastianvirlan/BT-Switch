@@ -76,6 +76,46 @@ final class BluetoothController {
         }
     }
 
+    struct PairedDevice: Identifiable, Equatable {
+        enum Kind { case keyboard, mouse, trackpad, other }
+        let address: String     // normalised, e.g. "10:94:bb:b9:73:74"
+        let name: String
+        let kind: Kind
+        let isConnected: Bool
+        var id: String { address }
+    }
+
+    /// Lists the Bluetooth devices paired with this Mac, without blocking
+    /// the caller. The completion runs on the main queue.
+    func pairedDevices(completion: @escaping ([PairedDevice]) -> Void) {
+        queue.async {
+            let devices = (IOBluetoothDevice.pairedDevices() ?? [])
+                .compactMap { $0 as? IOBluetoothDevice }
+                .compactMap { d -> PairedDevice? in
+                    guard let addr = d.addressString else { return nil }
+                    let name = d.name ?? d.nameOrAddress ?? addr
+                    return PairedDevice(address: MAC.normalize(addr), name: name,
+                                        kind: Self.kind(of: d, name: name), isConnected: d.isConnected())
+                }
+                .sorted { ($0.kind.sortOrder, $0.name) < ($1.kind.sortOrder, $1.name) }
+            DispatchQueue.main.async { completion(devices) }
+        }
+    }
+
+    private static func kind(of d: IOBluetoothDevice, name: String) -> PairedDevice.Kind {
+        let lower = name.lowercased()
+        if lower.contains("trackpad") { return .trackpad }
+        // Class of Device: major 0x05 = peripheral; minor bit 0x10 keyboard, 0x20 pointer.
+        if d.deviceClassMajor == BluetoothDeviceClassMajor(kBluetoothDeviceClassMajorPeripheral) {
+            let minor = d.deviceClassMinor
+            if minor & 0x10 != 0 { return .keyboard }
+            if minor & 0x20 != 0 { return .mouse }
+        }
+        if lower.contains("keyboard") { return .keyboard }
+        if lower.contains("mouse") { return .mouse }
+        return .other
+    }
+
     // MARK: - Mutating ops
 
     /// Pair-and-connect. Synchronous.
@@ -169,4 +209,27 @@ final class BluetoothController {
     func devicePairingUserPasskeyNotification(_ sender: Any!, passkey: BluetoothPasskey) {}
     func devicePairingStarted(_ sender: Any!) {}
     func devicePairingConnecting(_ sender: Any!) {}
+}
+
+extension BluetoothController.PairedDevice.Kind {
+    var sortOrder: Int {
+        switch self {
+        case .keyboard: return 0
+        case .mouse: return 1
+        case .trackpad: return 2
+        case .other: return 3
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .keyboard: return "keyboard"
+        case .mouse: return "computermouse"
+        case .trackpad: return "hand.point.up.left"
+        case .other: return "dot.radiowaves.left.and.right"
+        }
+    }
+
+    /// Magic keyboards, mice and trackpads are what BTSwitch is for.
+    var isInputDevice: Bool { self != .other }
 }
