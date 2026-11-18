@@ -245,7 +245,7 @@ final class SwitchCoordinator: ObservableObject {
 
         setStatus(.running("reconnecting here…"))
         var stranded: [String] = []
-        for mac in macs where !bluetooth.isConnected(mac) {
+        for mac in macs where !bluetooth.isReady(mac) {
             switch bluetooth.connect(mac) {
             case .success:
                 logger.info("  \(names[mac] ?? mac): reconnected here")

@@ -694,4 +694,21 @@ enum PeerFilter {
         }
         return false
     }
+
+    /// One of this Mac's own networks: an interface address and its netmask.
+    struct Network: Equatable {
+        let address: [UInt8]
+        let netmask: [UInt8]
+    }
+
+    /// True if `remote` is on the same network segment as one of this Mac's
+    /// interfaces. Covers home networks that hand out public IPv6
+    /// addresses, which `isLocal` alone would reject.
+    static func isOnLink(_ remote: [UInt8], networks: [Network]) -> Bool {
+        networks.contains { n in
+            n.address.count == remote.count && n.netmask.count == remote.count
+                && n.netmask.contains { $0 != 0 }   // ignore /0
+                && zip(zip(remote, n.address), n.netmask).allSatisfy { ($0.0 & $1) == ($0.1 & $1) }
+        }
+    }
 }

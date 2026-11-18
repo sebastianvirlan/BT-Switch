@@ -287,6 +287,22 @@ test("IPv6 peer filter") {
     check(!PeerFilter.isLocal(ipv6: global), "2001::")
 }
 
+test("on-link peers are accepted, including public IPv6 on the same /64") {
+    func v6(_ prefix: [UInt8], _ tail: UInt8) -> [UInt8] { prefix + [UInt8](repeating: 0, count: 15 - prefix.count) + [tail] }
+    let home: [UInt8] = [0x2a, 0x00, 0x23, 0xc7, 0x88, 0x80, 0x44, 0x01]
+    let mask64 = [UInt8](repeating: 0xff, count: 8) + [UInt8](repeating: 0, count: 8)
+    let nets = [PeerFilter.Network(address: v6(home, 1), netmask: mask64),
+                PeerFilter.Network(address: [192, 168, 1, 10], netmask: [255, 255, 255, 0])]
+
+    check(PeerFilter.isOnLink(v6(home, 0xab), networks: nets), "same /64 public IPv6")
+    check(!PeerFilter.isOnLink(v6([0x2a, 0x00, 0x23, 0xc7, 0x88, 0x80, 0x44, 0x02], 1), networks: nets), "different /64")
+    check(PeerFilter.isOnLink([192, 168, 1, 77], networks: nets), "same IPv4 subnet")
+    check(!PeerFilter.isOnLink([8, 8, 8, 8], networks: nets), "internet IPv4")
+    check(!PeerFilter.isOnLink([1, 2, 3, 4], networks: [PeerFilter.Network(address: [1, 1, 1, 1], netmask: [0, 0, 0, 0])]),
+          "a /0 route doesn't make everything local")
+    check(!PeerFilter.isOnLink([192, 168, 1, 77], networks: []), "no interfaces")
+}
+
 // MARK: Switch lock
 
 test("switch lock is exclusive") {

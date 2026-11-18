@@ -190,7 +190,7 @@ If this Mac isn't paired yet or has no peripherals configured, left-click opens 
 
 Occasionally a peripheral (most often the Magic Mouse) connects to the destination and drops a moment later. BTSwitch handles this in three steps:
 
-1. The destination re-checks each peripheral shortly after connecting it and retries any that dropped.
+1. A peripheral only counts as arrived once it's both connected *and* paired; a connection without a completed pairing works until the device sleeps, then can't reconnect. The destination re-checks each peripheral shortly after connecting it and retries any that dropped or didn't finish pairing.
 2. If one still isn't there, the source asks the destination to try once more.
 3. If that fails too, BTSwitch keeps the set together: the destination releases what it got and everything reconnects to the source Mac, so you never end up with the keyboard on one Mac and the mouse on the other. Click the icon to try again.
 
@@ -212,7 +212,7 @@ Settings → **Log** tab shows everything BTSwitch has done. Click **Copy All** 
 - **Requests:** every request and reply is encrypted with ChaCha20-Poly1305 using a key derived from the pairing key, and every request is signed with HMAC-SHA256 and carries a timestamp and a one-time nonce, so requests can't be read, forged or replayed. Each reply is bound to its request. The pairing key never crosses the network.
 - **Storage:** the pairing key is stored in the macOS Keychain. The shared token used by earlier versions is deleted on first launch.
 - **Unpairing:** clicking **Unpair** on either Mac makes both forget each other. If the other Mac is unreachable at that moment, it keeps its record until it next contacts this Mac and is told it isn't paired.
-- **Network exposure:** BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses (private IPv4 ranges, link-local, IPv6 unique-local, loopback, and 100.64.0.0/10 for Tailscale-style VPNs). It advertises its computer name via Bonjour on the local network.
+- **Network exposure:** BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses: private IPv4 ranges, link-local, IPv6 unique-local, loopback, 100.64.0.0/10 for Tailscale-style VPNs, and any address on the same network segment as one of this Mac's interfaces (for home networks that hand out public IPv6 addresses). It advertises its computer name via Bonjour on the local network.
 - No telemetry, no analytics, no network calls outside the LAN.
 - The pairing exchange itself is not encrypted: it carries only public keys and the two computer names. Error replies sent before a request is authenticated (such as "not paired") are also plain text and contain nothing secret.
 - Removing a peripheral relies on a private IOBluetooth method. If a macOS update removes it, BTSwitch logs a warning instead of silently claiming success.

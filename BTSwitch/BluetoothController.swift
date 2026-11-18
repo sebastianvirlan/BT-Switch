@@ -22,6 +22,7 @@ final class BluetoothController {
         case pairStartFailed(String, IOReturn)
         case openConnectionFailed(String, IOReturn)
         case notConnectedAfterOpen(String)
+        case connectedButNotPaired(String)
 
         var description: String {
             switch self {
@@ -32,6 +33,7 @@ final class BluetoothController {
             case .pairStartFailed(let m, let rc): return "pair start failed for \(m): 0x\(String(rc, radix: 16))"
             case .openConnectionFailed(let m, let rc): return "openConnection failed for \(m): 0x\(String(rc, radix: 16))"
             case .notConnectedAfterOpen(let m): return "openConnection ok but \(m) not reporting connected"
+            case .connectedButNotPaired(let m): return "\(m) connected but pairing didn't complete"
             }
         }
     }
@@ -60,6 +62,17 @@ final class BluetoothController {
     private let queue = DispatchQueue(label: "\(AppInfo.bundleID).bluetooth", qos: .userInitiated)
 
     // MARK: - Reads
+
+    /// Connected *and* paired. A device connected without a completed
+    /// pairing works until it idles, then can't reconnect, so only this
+    /// counts as "arrived".
+    func isReady(_ mac: String) -> Bool {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        return queue.sync {
+            guard let d = Self.device(mac) else { return false }
+            return d.isConnected() && d.isPaired()
+        }
+    }
 
     func isConnected(_ mac: String) -> Bool {
         dispatchPrecondition(condition: .notOnQueue(queue))
@@ -167,6 +180,13 @@ final class BluetoothController {
             return .failure(.invalidRSSI(mac))
         }
 
+        // A half-finished earlier attempt can leave the device connected
+        // but unpaired; drop that link so pairing starts from scratch.
+        if device.isConnected() && !device.isPaired() {
+            device.closeConnection()
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+
         guard let devicePair = IOBluetoothDevicePair(device: device) else {
             return .failure(.pairInitFailed(mac))
         }
@@ -187,13 +207,15 @@ final class BluetoothController {
                 return .failure(.openConnectionFailed(mac, openRC))
             }
 
-            // isConnected can lag a bit. Poll briefly.
-            let deadline = Date().addingTimeInterval(3)
+            // isConnected / isPaired can lag a bit. Poll until both are
+            // true: connected-but-unpaired looks fine now but the device
+            // won't reconnect after it sleeps.
+            let deadline = Date().addingTimeInterval(5)
             while Date() < deadline {
-                if device.isConnected() { return .success(()) }
+                if device.isConnected() && device.isPaired() { return .success(()) }
                 Thread.sleep(forTimeInterval: 0.2)
             }
-            return .failure(.notConnectedAfterOpen(mac))
+            return .failure(device.isConnected() ? .connectedButNotPaired(mac) : .notConnectedAfterOpen(mac))
         }
     }
 }

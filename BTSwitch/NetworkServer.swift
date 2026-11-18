@@ -144,11 +144,55 @@ final class NetworkServer: ObservableObject {
 
     private static func isLocalPeer(_ endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(let host, _) = endpoint else { return false }
+        let bytes: [UInt8]
         switch host {
-        case .ipv4(let a): return PeerFilter.isLocal(ipv4: [UInt8](a.rawValue))
-        case .ipv6(let a): return PeerFilter.isLocal(ipv6: [UInt8](a.rawValue))
-        default: return false
+        case .ipv4(let a):
+            bytes = [UInt8](a.rawValue)
+            if PeerFilter.isLocal(ipv4: bytes) { return true }
+        case .ipv6(let a):
+            bytes = [UInt8](a.rawValue)
+            if PeerFilter.isLocal(ipv6: bytes) { return true }
+        default:
+            return false
         }
+        return PeerFilter.isOnLink(bytes, networks: localNetworks())
+    }
+
+    /// This Mac's interface addresses and netmasks (IPv4 and IPv6).
+    private static func localNetworks() -> [PeerFilter.Network] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let first = head else { return [] }
+        defer { freeifaddrs(head) }
+
+        // The netmask's sa_family is sometimes left as 0, so read it using
+        // the family of the address it belongs to.
+        func bytes(_ sa: UnsafeMutablePointer<sockaddr>?, family: Int32) -> [UInt8]? {
+            guard let sa = sa else { return nil }
+            switch family {
+            case AF_INET:
+                return sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    withUnsafeBytes(of: $0.pointee.sin_addr) { Array($0) }
+                }
+            case AF_INET6:
+                return sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    withUnsafeBytes(of: $0.pointee.sin6_addr) { Array($0) }
+                }
+            default:
+                return nil
+            }
+        }
+
+        var out: [PeerFilter.Network] = []
+        for ifa in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ifa.pointee.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0,
+                  let family = ifa.pointee.ifa_addr.map({ Int32($0.pointee.sa_family) }),
+                  let addr = bytes(ifa.pointee.ifa_addr, family: family),
+                  let mask = bytes(ifa.pointee.ifa_netmask, family: family), mask.count == addr.count
+            else { continue }
+            out.append(PeerFilter.Network(address: addr, netmask: mask))
+        }
+        return out
     }
 
     /// Read until three complete lines have arrived (max 4 KB), then dispatch.
@@ -287,7 +331,7 @@ final class NetworkServer: ObservableObject {
             logger.info("verify from \(peerName): \(macs)")
             workQueue.async { [weak self] in
                 guard let self = self else { return }
-                let reports = macs.map { PeripheralReport(mac: $0, connected: self.bluetooth.isConnected($0)) }
+                let reports = macs.map { PeripheralReport(mac: $0, connected: self.bluetooth.isReady($0)) }
                 reply(PeripheralReport.encodeOK(reports))
             }
 
@@ -436,7 +480,7 @@ final class NetworkServer: ObservableObject {
     private func handleConnect(macs: [String]) -> String {
         var reports: [PeripheralReport] = []
         for mac in macs {
-            if bluetooth.isConnected(mac) {
+            if bluetooth.isReady(mac) {
                 logger.info("  \(mac): already connected")
                 reports.append(PeripheralReport(mac: mac, status: "already_connected"))
                 continue
@@ -472,12 +516,12 @@ final class NetworkServer: ObservableObject {
         guard reports.contains(where: \.isConnected) else { return reports }
         Thread.sleep(forTimeInterval: 1.5)
         return reports.map { report in
-            guard report.isConnected, !bluetooth.isConnected(report.mac) else { return report }
-            logger.warn("  \(report.mac): dropped right after connecting; retrying")
+            guard report.isConnected, !bluetooth.isReady(report.mac) else { return report }
+            logger.warn("  \(report.mac): dropped or didn't finish pairing; retrying")
             for attempt in 1...2 {
                 if case .success = bluetooth.connect(report.mac) {
                     Thread.sleep(forTimeInterval: 1)
-                    if bluetooth.isConnected(report.mac) {
+                    if bluetooth.isReady(report.mac) {
                         logger.info("  \(report.mac): reconnected and stayed (retry \(attempt))")
                         return PeripheralReport(mac: report.mac, status: "connected",
                                                 attempts: (report.attempts ?? 1) + attempt)
@@ -485,7 +529,7 @@ final class NetworkServer: ObservableObject {
                 }
             }
             logger.warn("  \(report.mac): kept dropping")
-            return PeripheralReport(mac: report.mac, status: "failed", error: "connected but dropped straight away")
+            return PeripheralReport(mac: report.mac, status: "failed", error: "kept dropping or didn't finish pairing")
         }
     }
 
