@@ -33,6 +33,8 @@ final class AppSettings: ObservableObject {
         static let peripherals = "peripherals"   // comma-separated MAC addresses
         static let port = "port"
         static let peripheralNames = "peripheralNames"
+        static let sendClipboard = "sendClipboard"
+        static let acceptClipboard = "acceptClipboard"
         // Removed in v3 (replaced by pairing); cleaned up on launch.
         static let legacyDestination = "destination"
         static let legacyToken = "token"
@@ -59,6 +61,16 @@ final class AppSettings: ObservableObject {
     /// Mac's Bluetooth list).
     @Published private(set) var peripheralNames: [String: String] {
         didSet { UserDefaults.standard.set(peripheralNames, forKey: Keys.peripheralNames) }
+    }
+
+    /// Send this Mac's clipboard text to the other Mac when switching away.
+    @Published var sendClipboard: Bool {
+        didSet { UserDefaults.standard.set(sendClipboard, forKey: Keys.sendClipboard) }
+    }
+
+    /// Put clipboard text received from the paired Mac on this Mac's clipboard.
+    @Published var acceptClipboard: Bool {
+        didSet { UserDefaults.standard.set(acceptClipboard, forKey: Keys.acceptClipboard) }
     }
 
     /// Parsed, normalised list of valid MACs (lowercase, colon-separated).
@@ -101,6 +113,9 @@ final class AppSettings: ObservableObject {
         let d = UserDefaults.standard
         self.peripheralsCSV = d.string(forKey: Keys.peripherals) ?? ""
         self.peripheralNames = (d.dictionary(forKey: Keys.peripheralNames) as? [String: String]) ?? [:]
+        // Both off unless the user opts in.
+        self.sendClipboard = d.bool(forKey: Keys.sendClipboard)
+        self.acceptClipboard = d.bool(forKey: Keys.acceptClipboard)
 
         let savedPort = d.integer(forKey: Keys.port)
         // Sanitise here too: an out-of-range value saved by an older build

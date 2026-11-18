@@ -43,6 +43,18 @@ final class NetworkClient {
         let lock = NSLock()
         var result: Result<String, NetworkFailure>?
         var didConnect = false
+        let requestNonce = BTProtocol.makeNonce()
+
+        /// Decrypts the reply; plain "ERR …" passes through.
+        func opened(_ line: String) -> Result<String, NetworkFailure> {
+            switch Sealing.openReply(line, pairingKey: target.key, requestNonce: requestNonce) {
+            case .success(let s): return .success(s)
+            case .failure(.undecryptable):
+                return .failure(.other("couldn't decrypt the reply from \(label); unpair and pair the two Macs again"))
+            case .failure(.unencrypted):
+                return .failure(.other("\(label) sent an unencrypted reply; make sure both Macs run the same BTSwitch build"))
+            }
+        }
         var responseBuffer = Data()   // only touched on `queue`
 
         func finish(_ r: Result<String, NetworkFailure>) {
@@ -55,19 +67,23 @@ final class NetworkClient {
         }
 
         func receiveLoop() {
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 8192) { data, _, isComplete, err in
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, err in
                 if let err = err {
                     finish(.failure(.other("lost connection to \(label) while waiting for a reply: \(err.localizedDescription)")))
                     return
                 }
                 if let data = data { responseBuffer.append(data) }
                 if let (lines, _) = BTProtocol.extractLines(responseBuffer, count: 1) {
-                    finish(.success(lines[0]))
+                    finish(opened(lines[0]))
+                    return
+                }
+                if responseBuffer.count > BTProtocol.maxRequestBytes {
+                    finish(.failure(.other("\(label) sent an oversized reply")))
                     return
                 }
                 if isComplete {
                     if let s = String(data: responseBuffer, encoding: .utf8), !s.isEmpty {
-                        finish(.success(s.trimmingCharacters(in: .whitespacesAndNewlines)))
+                        finish(opened(s.trimmingCharacters(in: .whitespacesAndNewlines)))
                     } else {
                         finish(.failure(.other("\(label) closed the connection without replying; is something other than BTSwitch on that port?")))
                     }
@@ -81,7 +97,8 @@ final class NetworkClient {
             switch state {
             case .ready:
                 lock.lock(); didConnect = true; lock.unlock()
-                let req = BTProtocol.makeRequest(senderID: AppInfo.instanceID, key: target.key, command: command)
+                let req = BTProtocol.makeRequest(senderID: AppInfo.instanceID, key: target.key,
+                                                 command: command, nonce: requestNonce)
                 conn.send(content: Data(req.utf8), completion: .contentProcessed { err in
                     if let err = err {
                         finish(.failure(.other("sending to \(label) failed: \(err.localizedDescription)")))

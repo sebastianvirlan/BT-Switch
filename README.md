@@ -32,7 +32,8 @@ You install BTSwitch on both Macs and pair them once. Each app:
 - Announces itself on the local network (Bonjour), so the other Mac can find it by name
 - Listens on a local TCP port for switch requests from the paired Mac
 - When clicked, removes the configured peripherals from its own Bluetooth database, then asks the paired Mac (over the network) to re-pair and connect them
-- Signs every request with a key the two Macs agreed during pairing
+- Encrypts and signs every request with a key the two Macs agreed during pairing
+- Optionally carries your copied text along when you switch
 
 Click the icon on Mac A, peripherals move to Mac B. Click on Mac B, peripherals move back.
 
@@ -130,6 +131,15 @@ The icon reflects current state:
 | Mixed indicator | Some are here, some aren't |
 | Spinning arrows | Switch in progress |
 
+## Clipboard
+
+BTSwitch can take your copied text along when you switch, so you can paste it on the other Mac. It's off by default; turn it on in Settings → General → **Clipboard**:
+
+- **Send copied text to … when switching to it**: on the Mac you switch *from*
+- **Accept copied text from …**: on the Mac you switch *to*
+
+Each Mac decides for itself, so you can, for example, accept text on one Mac but never send from it. Only plain text up to 256 KB is sent, encrypted with the pairing key. Items that password managers mark as concealed or transient (see [nspasteboard.org](http://nspasteboard.org)) are never sent. The text is sent after the peripherals arrive; if that fails, the switch still counts as successful and the log says why.
+
 ## Troubleshooting
 
 ### "can't find … on the network"
@@ -166,7 +176,7 @@ Requests are timestamped to prevent replay, so both Macs' clocks must be within 
 
 ### "the other Mac runs an older/newer BTSwitch"
 
-The network protocol changed (version 3 introduced pairing). Update BTSwitch on both Macs.
+The network protocol changed (version 3 introduced pairing, version 4 encryption). Update BTSwitch on both Macs.
 
 ### Keychain prompt after rebuilding
 
@@ -176,9 +186,15 @@ The pairing key is stored in your Keychain. Because `build.sh` ad-hoc signs the 
 
 If this Mac isn't paired yet or has no peripherals configured, left-click opens Settings instead of switching.
 
-### Peripheral connects then jumps back to the other Mac
+### A peripheral connects, then drops
 
-This is rare but can happen if the source Mac doesn't fully release the peripheral. Try clicking the icon again — the second attempt usually settles it. If it persists, restart Bluetooth on the source Mac:
+Occasionally a peripheral (most often the Magic Mouse) connects to the destination and drops a moment later. BTSwitch handles this in three steps:
+
+1. The destination re-checks each peripheral shortly after connecting it and retries any that dropped.
+2. If one still isn't there, the source asks the destination to try once more.
+3. If that fails too, BTSwitch keeps the set together: the destination releases what it got and everything reconnects to the source Mac, so you never end up with the keyboard on one Mac and the mouse on the other. Click the icon to try again.
+
+If a peripheral keeps dropping, restart Bluetooth on both Macs:
 
 ```bash
 sudo pkill bluetoothd    # auto-respawns
@@ -193,12 +209,12 @@ Settings → **Log** tab shows everything BTSwitch has done. Click **Copy All** 
 ## Security
 
 - **Pairing:** the two Macs agree a key with an X25519 key exchange. Both screens show a 6-digit code derived from the exchange, and the receiving Mac's user must click **Allow**. The requesting Mac commits to its key before seeing the other's, so nobody in the middle can make the codes match; an interception shows up as different codes.
-- **Requests:** every request is signed with HMAC-SHA256 using that key, and carries a timestamp and a one-time nonce, so requests can't be forged or replayed. The key never crosses the network.
+- **Requests:** every request and reply is encrypted with ChaCha20-Poly1305 using a key derived from the pairing key, and every request is signed with HMAC-SHA256 and carries a timestamp and a one-time nonce, so requests can't be read, forged or replayed. Each reply is bound to its request. The pairing key never crosses the network.
 - **Storage:** the pairing key is stored in the macOS Keychain. The shared token used by earlier versions is deleted on first launch.
 - **Unpairing:** clicking **Unpair** on either Mac makes both forget each other. If the other Mac is unreachable at that moment, it keeps its record until it next contacts this Mac and is told it isn't paired.
 - **Network exposure:** BTSwitch listens on one TCP port (default 52525) and only accepts connections from local-network addresses (private IPv4 ranges, link-local, IPv6 unique-local, loopback, and 100.64.0.0/10 for Tailscale-style VPNs). It advertises its computer name via Bonjour on the local network.
 - No telemetry, no analytics, no network calls outside the LAN.
-- Traffic is not encrypted. Anyone on your network can see which commands are sent and which peripheral addresses are involved, but can't forge or replay them.
+- The pairing exchange itself is not encrypted: it carries only public keys and the two computer names. Error replies sent before a request is authenticated (such as "not paired") are also plain text and contain nothing secret.
 - Removing a peripheral relies on a private IOBluetooth method. If a macOS update removes it, BTSwitch logs a warning instead of silently claiming success.
 
 ## Configuration reference
@@ -226,6 +242,7 @@ BTSwitch/
 │   ├── PairingController.swift    Pairing, requesting side
 │   ├── PairingPrompt.swift        The Allow/Deny prompt, receiving side
 │   ├── PeerDirectory.swift        Bonjour discovery
+│   ├── ClipboardBridge.swift      Reads/writes the clipboard
 │   ├── Protocol.swift             Wire protocol, auth, pairing crypto (pure, unit-tested)
 │   ├── SettingsView.swift         Settings UI
 │   ├── SwitchCoordinator.swift    Orchestrates a switch
@@ -254,6 +271,7 @@ Run the unit tests with:
 
 ### Upgrading
 
+- **To 4.x:** traffic between the Macs is now encrypted (protocol `BT-SWITCH/4`). Update **both** Macs; existing pairings keep working.
 - **To 3.x:** the shared token is gone; pair the Macs instead (see First-time setup). The protocol is now `BT-SWITCH/3`, so update **both** Macs. Your peripherals and port are kept; the old token and destination address are deleted.
 - **From 1.x:** the bundle ID changed from `com.user.btswitch` to `io.github.sebastianvirlan.btswitch`. Peripherals and port are migrated automatically, but macOS treats it as a new app, so you'll be asked for Bluetooth and Local Network permission again.
 

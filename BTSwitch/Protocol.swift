@@ -7,28 +7,33 @@ import CryptoKit
 
 // MARK: - Wire protocol
 
-/// BT-SWITCH/3 wire protocol (line-delimited UTF-8, one exchange per TCP connection).
+/// BT-SWITCH/4 wire protocol (line-delimited UTF-8, one exchange per TCP connection).
 ///
 /// Commands between paired Macs:
 ///
-///     line 1: BT-SWITCH/3
+///     line 1: BT-SWITCH/4
 ///     line 2: AUTH <sender_id> <unix_timestamp> <nonce_hex> <hmac_hex>
-///     line 3: <command>
+///     line 3: SEALED <base64 ChaChaPoly box of the command>
+///     reply:  SEALED <base64 ChaChaPoly box of the reply>   (or a plain "ERR <code>")
 ///
-/// `hmac_hex` = hex(HMAC-SHA256(key: pairing key, message:
-/// "<sender_id>\n<timestamp>\n<nonce>\n<command>")). The pairing key is
-/// established once by the pairing exchange below and never crosses the
-/// network. Requests outside `maxClockSkew` are rejected and each nonce is
-/// accepted once, so captured requests can't be replayed.
+/// The command and reply are encrypted with a key derived from the pairing
+/// key (see `Sealing`); the request box is bound to the sender and nonce,
+/// the reply box to the request nonce. `hmac_hex` = hex(HMAC-SHA256(key:
+/// pairing key, message: "<sender_id>\n<timestamp>\n<nonce>\n<line 3>")).
+/// The pairing key never crosses the network. Requests outside
+/// `maxClockSkew` are rejected and each nonce is accepted once, so captured
+/// requests can't be replayed. Plain-text "OK" replies are refused.
 ///
 ///     PING                       -> "OK pong <instance_id> <name>" (or "ERR busy" mid-switch)
 ///     CONNECT <mac1>,<mac2>,...  -> "OK <json [PeripheralReport]>"
 ///     VERIFY  <mac1>,<mac2>,...  -> "OK <json [PeripheralReport]>"
+///     RELEASE <mac1>,<mac2>,...  -> "OK <json [PeripheralReport]>" (unpair them here; used to roll back)
+///     CLIPBOARD <base64 text>    -> "OK clipboard" (or "ERR clipboard_disabled")
 ///     UNPAIR                     -> "OK unpaired"
 ///
 /// Pairing (initiator I → responder R), see `Pairing`:
 ///
-///     I: BT-SWITCH/3
+///     I: BT-SWITCH/4
 ///     I: PAIR <id_I> <name_I_base64>
 ///     I: COMMIT <sha256(pub_I || nonce_I)>
 ///     R: KEY <id_R> <name_R_base64> <pub_R> <nonce_R>
@@ -42,10 +47,13 @@ import CryptoKit
 ///
 /// Errors are "ERR <code> [detail]"; see `BTProtocol.describe(errorCode:)`.
 enum BTProtocol {
-    static let version = "BT-SWITCH/3"
-    static let legacyVersions: Set<String> = ["BT-SWITCH/1", "BT-SWITCH/2"]
+    static let version = "BT-SWITCH/4"
+    static let legacyVersions: Set<String> = ["BT-SWITCH/1", "BT-SWITCH/2", "BT-SWITCH/3"]
     static let maxClockSkew: TimeInterval = 60
-    static let maxRequestBytes = 4096
+    /// Large enough for a sealed clipboard payload.
+    static let maxRequestBytes = 512 * 1024
+    /// Largest clipboard text sent, in UTF-8 bytes.
+    static let maxClipboardBytes = 256 * 1024
     static let defaultPort = 52525
     static let bonjourType = "_btswitch._tcp"
 
@@ -92,15 +100,17 @@ enum BTProtocol {
         return hex(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: key)))
     }
 
+    /// Builds an encrypted, signed request. Keep `nonce` to open the reply.
     static func makeRequest(senderID: String, key: Data, command: String,
                             now: Date = Date(), nonce: String = makeNonce()) -> String {
         let ts = Int(now.timeIntervalSince1970)
-        let sig = signature(key: key, senderID: senderID, timestamp: ts, nonce: nonce, command: command)
-        return "\(version)\nAUTH \(senderID) \(ts) \(nonce) \(sig)\n\(command)\n"
+        let sealed = Sealing.sealRequest(command, pairingKey: key, senderID: senderID, nonce: nonce)
+        let sig = signature(key: key, senderID: senderID, timestamp: ts, nonce: nonce, command: sealed)
+        return "\(version)\nAUTH \(senderID) \(ts) \(nonce) \(sig)\n\(sealed)\n"
     }
 
     enum AuthResult: Equatable {
-        case ok(senderID: String)
+        case ok(senderID: String, nonce: String)
         case malformed
         case notPaired
         case badSignature
@@ -143,7 +153,7 @@ enum BTProtocol {
 
         guard abs(now.timeIntervalSince1970 - TimeInterval(ts)) <= maxClockSkew else { return .stale }
         guard replayGuard.accept(nonce: "\(sender):\(nonce)", now: now) else { return .replay }
-        return .ok(senderID: sender)
+        return .ok(senderID: sender, nonce: nonce)
     }
 
     /// Compares two strings in time that depends only on their length.
@@ -165,6 +175,9 @@ enum BTProtocol {
         case "bad_auth": return "malformed request; make sure both Macs run the same BTSwitch build"
         case "stale_request": return "the two Macs' clocks differ by more than \(Int(maxClockSkew))s; turn on automatic date & time on both"
         case "replay": return "request rejected as a replay"
+        case "clipboard_disabled": return "the other Mac doesn't accept clipboard text; turn it on in its Settings"
+        case "too_long": return "the request was too large for the other Mac"
+        case "bad_seal": return "the other Mac couldn't decrypt the request; unpair and pair the two Macs again"
         case "busy": return "the other Mac is busy (switching or showing a pairing request); try again"
         case "denied": return "pairing was declined on the other Mac"
         case "timeout": return "nobody approved the pairing on the other Mac in time"
@@ -229,6 +242,93 @@ enum BTProtocol {
 
     static func isValidInstanceID(_ s: Substring) -> Bool {
         !s.isEmpty && s.count <= 64 && s.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" }
+    }
+}
+
+// MARK: - Encryption
+
+/// Encrypts commands and replies between paired Macs with ChaCha20-Poly1305.
+/// The encryption key is derived from the pairing key with HKDF, so it's
+/// independent of the HMAC key and existing pairings don't need redoing.
+enum Sealing {
+    static let prefix = "SEALED "
+
+    static func encryptionKey(from pairingKey: Data) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: pairingKey),
+                               info: Data("btswitch-encryption-v1".utf8), outputByteCount: 32)
+    }
+
+    static func requestContext(senderID: String, nonce: String) -> Data {
+        Data("btswitch-request\n\(senderID)\n\(nonce)".utf8)
+    }
+
+    static func replyContext(requestNonce: String) -> Data {
+        Data("btswitch-reply\n\(requestNonce)".utf8)
+    }
+
+    static func seal(_ plaintext: String, pairingKey: Data, context: Data) -> String {
+        // ChaChaPoly.seal only throws for invalid key/nonce sizes, which
+        // can't happen here.
+        let box = try! ChaChaPoly.seal(Data(plaintext.utf8), using: encryptionKey(from: pairingKey),
+                                       authenticating: context)
+        return prefix + box.combined.base64EncodedString()
+    }
+
+    /// nil if the line isn't sealed, was tampered with, or used another key/context.
+    static func open(_ line: String, pairingKey: Data, context: Data) -> String? {
+        guard line.hasPrefix(prefix),
+              let combined = Data(base64Encoded: String(line.dropFirst(prefix.count))),
+              let box = try? ChaChaPoly.SealedBox(combined: combined),
+              let plain = try? ChaChaPoly.open(box, using: encryptionKey(from: pairingKey), authenticating: context)
+        else { return nil }
+        return String(data: plain, encoding: .utf8)
+    }
+
+    static func sealRequest(_ command: String, pairingKey: Data, senderID: String, nonce: String) -> String {
+        seal(command, pairingKey: pairingKey, context: requestContext(senderID: senderID, nonce: nonce))
+    }
+
+    static func openRequest(_ line: String, pairingKey: Data, senderID: String, nonce: String) -> String? {
+        open(line, pairingKey: pairingKey, context: requestContext(senderID: senderID, nonce: nonce))
+    }
+
+    static func sealReply(_ reply: String, pairingKey: Data, requestNonce: String) -> String {
+        seal(reply, pairingKey: pairingKey, context: replyContext(requestNonce: requestNonce))
+    }
+
+    enum ReplyError: Error, Equatable { case undecryptable, unencrypted }
+
+    /// Opens a reply. Plain "ERR …" replies pass through (they're sent
+    /// before or instead of authentication and carry no secrets); a plain
+    /// "OK …" is refused so a downgrade can't slip through.
+    static func openReply(_ line: String, pairingKey: Data, requestNonce: String) -> Result<String, ReplyError> {
+        if line.hasPrefix(prefix) {
+            guard let plain = open(line, pairingKey: pairingKey, context: replyContext(requestNonce: requestNonce))
+            else { return .failure(.undecryptable) }
+            return .success(plain)
+        }
+        return ErrorReply(line) != nil ? .success(line) : .failure(.unencrypted)
+    }
+}
+
+// MARK: - Clipboard
+
+enum Clipboard {
+    static let commandPrefix = "CLIPBOARD "
+
+    /// nil if the text is empty or too large to send.
+    static func command(for text: String) -> String? {
+        let bytes = Data(text.utf8)
+        guard !bytes.isEmpty, bytes.count <= BTProtocol.maxClipboardBytes else { return nil }
+        return commandPrefix + bytes.base64EncodedString()
+    }
+
+    static func text(fromCommand command: String) -> String? {
+        guard command.hasPrefix(commandPrefix),
+              let data = Data(base64Encoded: String(command.dropFirst(commandPrefix.count))),
+              data.count <= BTProtocol.maxClipboardBytes
+        else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }
 

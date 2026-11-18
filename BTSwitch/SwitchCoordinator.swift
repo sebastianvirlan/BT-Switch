@@ -104,24 +104,41 @@ final class SwitchCoordinator: ObservableObject {
         }
         let dest = t.label
 
+        // Read the clipboard now, on main, so it's what was copied at click time.
+        var clipboard: String?
+        if settings.sendClipboard {
+            switch ClipboardBridge.readForSending() {
+            case .text(let s): clipboard = s
+            case .skipped(let why): logger.info("clipboard not sent: \(why)")
+            }
+        }
+
         // Also blocks while the other Mac is pushing peripherals to us.
         guard switchLock.tryAcquire() else {
             logger.warn("switch already in progress, ignoring")
             return
         }
 
+        let names = settings.peripheralNames
         setStatus(.running("pinging \(dest)…"))
         logger.info("switch start: dest=\(dest) macs=\(macs)")
 
         workQueue.async { [weak self] in
             guard let self = self else { return }
             defer { self.switchLock.release() }
-            self.runSwitch(target: t, macs: macs)
+            let succeeded = self.runSwitch(target: t, macs: macs, names: names)
+            if succeeded, let text = clipboard {
+                self.sendClipboard(text, to: t)
+            }
         }
     }
 
-    private func runSwitch(target: PeerTarget, macs: [String]) {
+    /// Returns true if every peripheral arrived on the destination.
+    private func runSwitch(target: PeerTarget, macs: [String], names: [String: String]) -> Bool {
         let dest = target.label
+        func label(_ macs: [String]) -> String {
+            macs.map { names[$0] ?? $0 }.joined(separator: ", ")
+        }
         func send(_ command: String, timeout: TimeInterval) -> Result<String, NetworkFailure> {
             NetworkClient.send(to: target, command: command, timeout: timeout)
         }
@@ -133,11 +150,11 @@ final class SwitchCoordinator: ObservableObject {
         switch send("PING", timeout: 5) {
         case .failure(let e):
             logger.error("ping failed: \(e)")
-            return fail("\(e)")
+            fail("\(e)"); return false
         case .success(let resp):
             guard let pong = PingReply(resp) else {
                 logger.error("ping rejected: \(resp)")
-                return fail(BTProtocol.describe(response: resp))
+                fail(BTProtocol.describe(response: resp)); return false
             }
             logger.info("ping ok: \(pong.name ?? dest)")
         }
@@ -172,50 +189,91 @@ final class SwitchCoordinator: ObservableObject {
         }
 
         // 4. Verify which peripherals actually ended up on the destination.
-        //    If CONNECT timed out the destination may still be busy, so
-        //    allow VERIFY time to queue behind it.
+        //    Some peripherals (notably the Magic Mouse) occasionally report
+        //    connected and then drop a moment later, so don't trust CONNECT
+        //    alone. If CONNECT timed out the destination may still be busy,
+        //    so allow VERIFY time to queue behind it.
         setStatus(.running("verifying…"))
-        var onDestination: Set<String>?
-        switch send("VERIFY \(macList)", timeout: connectProblem == nil ? 10 : 30) {
-        case .success(let resp):
-            logger.info("VERIFY: \(resp)")
-            if let reports = PeripheralReport.decodeOK(resp) {
-                onDestination = Set(reports.filter(\.isConnected).map(\.mac))
+        func verify(_ list: [String], timeout: TimeInterval) -> Set<String>? {
+            switch send("VERIFY \(list.joined(separator: ","))", timeout: timeout) {
+            case .success(let resp):
+                logger.info("VERIFY: \(resp)")
+                return PeripheralReport.decodeOK(resp).map { Set($0.filter(\.isConnected).map(\.mac)) }
+            case .failure(let e):
+                logger.warn("verify call failed: \(e)")
+                return nil
             }
-        case .failure(let e):
-            logger.warn("verify call failed: \(e)")
         }
         // Fall back to what CONNECT reported. If we know nothing, assume
-        // nothing arrived — reconnecting here is the safe default.
-        let arrived = onDestination
+        // nothing arrived.
+        var arrived = verify(macs, timeout: connectProblem == nil ? 10 : 30)
             ?? Set((connectReports ?? []).filter(\.isConnected).map(\.mac))
-        let missing = macs.filter { !arrived.contains($0) }
+        var missing = macs.filter { !arrived.contains($0) }
+
+        // 5. One more try for stragglers, as long as the destination is
+        //    answering normally.
+        if !missing.isEmpty, connectReports != nil {
+            logger.warn("not on \(dest) yet: \(label(missing)); asking it to try again")
+            setStatus(.running("retrying \(label(missing)) on \(dest)…"))
+            switch send("CONNECT \(missing.joined(separator: ","))", timeout: 60) {
+            case .success(let resp): logger.info("retry CONNECT response: \(resp)")
+            case .failure(let e): logger.warn("retry CONNECT failed: \(e)")
+            }
+            if let now = verify(macs, timeout: 10) { arrived = now }
+            missing = macs.filter { !arrived.contains($0) }
+        }
 
         if missing.isEmpty {
             logger.info("switch complete")
             setStatus(.success(Date()))
-            return
+            return true
         }
 
-        // 5. Roll back: bring the stragglers back to this Mac.
-        logger.warn("not on destination: \(missing); reconnecting locally")
+        // 6. All or nothing: rather than leave the keyboard on one Mac and
+        //    the mouse on the other, ask the destination to release what it
+        //    got and bring everything back here.
+        let reason = connectProblem ?? "\(label(missing)) didn't connect on \(dest)"
+        logger.warn("\(reason); bringing all peripherals back to this Mac")
+        let toRelease = macs.filter { arrived.contains($0) }
+        if !toRelease.isEmpty {
+            setStatus(.running("taking peripherals back from \(dest)…"))
+            switch send("RELEASE \(toRelease.joined(separator: ","))", timeout: 20) {
+            case .success(let resp): logger.info("RELEASE response: \(resp)")
+            case .failure(let e): logger.warn("couldn't ask \(dest) to release \(label(toRelease)): \(e)")
+            }
+        }
+
         setStatus(.running("reconnecting here…"))
         var stranded: [String] = []
-        for mac in missing {
+        for mac in macs where !bluetooth.isConnected(mac) {
             switch bluetooth.connect(mac) {
             case .success:
-                logger.info("  \(mac): reconnected locally")
+                logger.info("  \(names[mac] ?? mac): reconnected here")
             case .failure(let e):
-                logger.error("  \(mac): local reconnect failed - \(e)")
+                logger.error("  \(names[mac] ?? mac): couldn't reconnect here - \(e)")
                 stranded.append(mac)
             }
         }
 
-        let reason = connectProblem ?? "\(missing.count) of \(macs.count) peripheral(s) did not connect on \(dest)"
         if stranded.isEmpty {
-            fail("\(reason); reconnected here")
+            fail("\(reason); kept everything on this Mac. Try again")
         } else {
-            fail("\(reason); could not reconnect \(stranded.joined(separator: ", ")) here — wake it and pair via System Settings")
+            fail("\(reason); couldn't reconnect \(label(stranded)) here. Wake it and click the icon again, or pair it in System Settings")
+        }
+        return false
+    }
+
+    /// Sends clipboard text after a successful switch. Failures are logged
+    /// but don't affect the switch.
+    private func sendClipboard(_ text: String, to target: PeerTarget) {
+        guard let command = Clipboard.command(for: text) else { return }
+        switch NetworkClient.send(to: target, command: command, timeout: 10) {
+        case .success(let resp) where resp == "OK clipboard":
+            logger.info("sent clipboard text to \(target.label) (\(text.utf8.count) bytes)")
+        case .success(let resp):
+            logger.warn("clipboard not delivered: \(BTProtocol.describe(response: resp))")
+        case .failure(let e):
+            logger.warn("clipboard not delivered: \(e)")
         }
     }
 

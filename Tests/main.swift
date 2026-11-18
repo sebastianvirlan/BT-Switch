@@ -62,11 +62,12 @@ test("framing returns leftover bytes after the lines") {
 
 test("signed request round-trips") {
     let req = BTProtocol.makeRequest(senderID: senderID, key: key, command: "PING", now: now, nonce: nonce)
-    check(req.hasPrefix("BT-SWITCH/3\n"), "version line")
+    check(req.hasPrefix("BT-SWITCH/4\n"), "version line")
     let (auth, cmd) = authLine(req)
-    check(cmd == "PING", "command")
+    check(cmd.hasPrefix("SEALED ") && !req.contains("PING"), "command is encrypted on the wire")
+    check(Sealing.openRequest(cmd, pairingKey: key, senderID: senderID, nonce: nonce) == "PING", "decrypts")
     check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now,
-                            replayGuard: ReplayGuard()) == .ok(senderID: senderID), "valid request")
+                            replayGuard: ReplayGuard()) == .ok(senderID: senderID, nonce: nonce), "valid request")
 }
 
 test("unknown sender is not paired") {
@@ -98,13 +99,13 @@ test("stale and future requests are rejected") {
     check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key),
                             now: now.addingTimeInterval(-61), replayGuard: g) == .stale, "61s early")
     check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key),
-                            now: now.addingTimeInterval(59), replayGuard: g) == .ok(senderID: senderID), "59s late is fine")
+                            now: now.addingTimeInterval(59), replayGuard: g) == .ok(senderID: senderID, nonce: nonce), "59s late is fine")
 }
 
 test("replayed request is rejected") {
     let (auth, cmd) = signed("PING")
     let g = ReplayGuard()
-    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID), "first")
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID, nonce: nonce), "first")
     check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .replay, "second")
 }
 
@@ -112,7 +113,7 @@ test("bad signature does not consume the nonce") {
     let (auth, cmd) = signed("PING")
     let g = ReplayGuard()
     _ = BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(otherKey), now: now, replayGuard: g)
-    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID),
+    check(BTProtocol.verify(authLine: auth, command: cmd, keyFor: keyFor(key), now: now, replayGuard: g) == .ok(senderID: senderID, nonce: nonce),
           "nonce still usable after a forged attempt")
 }
 
@@ -150,6 +151,66 @@ test("error descriptions") {
     check(BTProtocol.describe(errorCode: "denied").contains("declined"), "denied text")
     check(BTProtocol.describe(errorCode: "weird").contains("weird"), "unknown code passes through")
     check(BTProtocol.describe(response: "huh").contains("unexpected response"), "garbage")
+}
+
+// MARK: Encryption
+
+test("requests and replies are encrypted and bound to their context") {
+    let sealed = Sealing.sealRequest("CONNECT aa:bb:cc:dd:ee:ff", pairingKey: key, senderID: senderID, nonce: nonce)
+    check(!sealed.contains("aa:bb"), "no plaintext")
+    check(Sealing.openRequest(sealed, pairingKey: otherKey, senderID: senderID, nonce: nonce) == nil, "wrong key")
+    check(Sealing.openRequest(sealed, pairingKey: key, senderID: "someoneelse", nonce: nonce) == nil, "wrong sender")
+    check(Sealing.openRequest(sealed, pairingKey: key, senderID: senderID, nonce: String(repeating: "1", count: 32)) == nil,
+          "wrong nonce")
+
+    let reply = Sealing.sealReply("OK pong abc Studio", pairingKey: key, requestNonce: nonce)
+    check(Sealing.openReply(reply, pairingKey: key, requestNonce: nonce) == .success("OK pong abc Studio"), "reply opens")
+    check(Sealing.openReply(reply, pairingKey: key, requestNonce: "other") == .failure(.undecryptable),
+          "reply from another request is refused")
+}
+
+test("tampered ciphertext is refused") {
+    var line = Sealing.sealRequest("PING", pairingKey: key, senderID: senderID, nonce: nonce)
+    let b64 = String(line.dropFirst(Sealing.prefix.count))
+    var bytes = Data(base64Encoded: b64)!
+    bytes[bytes.count / 2] ^= 0x01
+    line = Sealing.prefix + bytes.base64EncodedString()
+    check(Sealing.openRequest(line, pairingKey: key, senderID: senderID, nonce: nonce) == nil, "bit flip detected")
+    check(Sealing.open("SEALED !!!", pairingKey: key, context: Data()) == nil, "garbage")
+}
+
+test("plain replies: errors pass, OK is refused") {
+    check(Sealing.openReply("ERR not_paired", pairingKey: key, requestNonce: nonce) == .success("ERR not_paired"), "plain error")
+    check(Sealing.openReply("OK pong", pairingKey: key, requestNonce: nonce) == .failure(.unencrypted), "downgrade refused")
+}
+
+test("same nonce, different messages give different ciphertexts") {
+    let a = Sealing.sealRequest("PING", pairingKey: key, senderID: senderID, nonce: nonce)
+    let b = Sealing.sealRequest("PING", pairingKey: key, senderID: senderID, nonce: nonce)
+    check(a != b, "random AEAD nonce per message")
+}
+
+// MARK: Clipboard
+
+test("clipboard command round-trips unicode and newlines") {
+    let text = "héllo 👋\nline two\ttab"
+    let cmd = Clipboard.command(for: text)
+    check(cmd?.hasPrefix("CLIPBOARD ") == true && !(cmd ?? "").contains("\n"), "single line")
+    check(cmd.flatMap(Clipboard.text(fromCommand:)) == text, "round-trip")
+}
+
+test("clipboard size limits") {
+    check(Clipboard.command(for: "") == nil, "empty")
+    check(Clipboard.command(for: String(repeating: "a", count: BTProtocol.maxClipboardBytes)) != nil, "at limit")
+    check(Clipboard.command(for: String(repeating: "a", count: BTProtocol.maxClipboardBytes + 1)) == nil, "over limit")
+    check(Clipboard.text(fromCommand: "CLIPBOARD !!!") == nil, "bad base64")
+    check(Clipboard.text(fromCommand: "PING") == nil, "not a clipboard command")
+}
+
+test("a full-size clipboard request fits the request limit") {
+    let cmd = Clipboard.command(for: String(repeating: "é", count: BTProtocol.maxClipboardBytes / 2))!
+    let req = BTProtocol.makeRequest(senderID: senderID, key: key, command: cmd, now: now, nonce: nonce)
+    check(req.utf8.count < BTProtocol.maxRequestBytes, "\(req.utf8.count) bytes")
 }
 
 // MARK: Port

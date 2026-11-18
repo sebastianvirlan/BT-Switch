@@ -153,7 +153,7 @@ final class NetworkServer: ObservableObject {
 
     /// Read until three complete lines have arrived (max 4 KB), then dispatch.
     private func receiveRequest(conn: NWConnection, accumulated: Data = Data()) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: BTProtocol.maxRequestBytes) { [weak self] data, _, isComplete, error in
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
 
             if let error = error {
@@ -210,9 +210,11 @@ final class NetworkServer: ObservableObject {
                                      keyFor: { [pairing] in pairing.key(for: $0) },
                                      replayGuard: replayGuard)
         let sender: String
+        let requestNonce: String
         switch auth {
-        case .ok(let id):
+        case .ok(let id, let nonce):
             sender = id
+            requestNonce = nonce
         case .notPaired:
             logger.warn("rejected \(from): not paired with this Mac")
             respond(conn: conn, "ERR not_paired\n")
@@ -227,25 +229,58 @@ final class NetworkServer: ObservableObject {
             return
         }
 
+        guard let key = pairing.key(for: sender),
+              let command = Sealing.openRequest(line3, pairingKey: key, senderID: sender, nonce: requestNonce)
+        else {
+            logger.warn("rejected \(from): couldn't decrypt the request")
+            respond(conn: conn, "ERR bad_seal\n")
+            return
+        }
+
         // Remember where the paired Mac is, in case Bonjour can't see it later.
         pairing.updateAddress(from, for: sender)
         let peerName = pairing.current?.name ?? from
 
+        // Every reply from here on is encrypted and bound to this request.
+        let reply: (String) -> Void = { [weak self] text in
+            self?.respond(conn: conn, Sealing.sealReply(text, pairingKey: key, requestNonce: requestNonce) + "\n")
+        }
+        dispatchCommand(command, from: peerName, reply: reply)
+    }
+
+    private func dispatchCommand(_ command: String, from peerName: String, reply: @escaping (String) -> Void) {
+        let line3 = command
         switch line3 {
         case "PING":
             if switchLock.isHeld {
                 logger.info("ping from \(peerName) while busy")
-                respond(conn: conn, "ERR busy\n")
+                reply("ERR busy")
             } else {
                 logger.info("ping from \(peerName)")
-                let reply = PingReply(instanceID: AppInfo.instanceID, name: AppInfo.computerName)
-                respond(conn: conn, reply.encoded + "\n")
+                reply(PingReply(instanceID: AppInfo.instanceID, name: AppInfo.computerName).encoded)
             }
 
         case "UNPAIR":
             logger.info("\(peerName) unpaired from this Mac")
+            reply("OK unpaired")
             pairing.clear()
-            respond(conn: conn, "OK unpaired\n")
+
+        case let s where s.hasPrefix(Clipboard.commandPrefix):
+            guard let text = Clipboard.text(fromCommand: s) else {
+                logger.warn("clipboard from \(peerName) rejected: malformed or too large")
+                reply("ERR too_long")
+                return
+            }
+            DispatchQueue.main.async { [settings, logger] in
+                guard settings.acceptClipboard else {
+                    logger.info("ignored clipboard text from \(peerName) (accepting is turned off)")
+                    reply("ERR clipboard_disabled")
+                    return
+                }
+                ClipboardBridge.write(text, from: peerName)
+                logger.info("received clipboard text from \(peerName) (\(text.utf8.count) bytes)")
+                reply("OK clipboard")
+            }
 
         case let s where s.hasPrefix("VERIFY "):
             let macs = MAC.parseList(String(s.dropFirst("VERIFY ".count)))
@@ -253,14 +288,14 @@ final class NetworkServer: ObservableObject {
             workQueue.async { [weak self] in
                 guard let self = self else { return }
                 let reports = macs.map { PeripheralReport(mac: $0, connected: self.bluetooth.isConnected($0)) }
-                self.respond(conn: conn, PeripheralReport.encodeOK(reports) + "\n")
+                reply(PeripheralReport.encodeOK(reports))
             }
 
         case let s where s.hasPrefix("CONNECT "):
             let macs = MAC.parseList(String(s.dropFirst("CONNECT ".count)))
             guard switchLock.tryAcquire() else {
                 logger.warn("connect from \(peerName) rejected: a switch is already running on this Mac")
-                respond(conn: conn, "ERR busy\n")
+                reply("ERR busy")
                 return
             }
             logger.info("connect from \(peerName): \(macs)")
@@ -272,12 +307,33 @@ final class NetworkServer: ObservableObject {
             workQueue.async { [weak self] in
                 guard let self = self else { return }
                 defer { self.switchLock.release() }
-                self.handleConnect(conn: conn, macs: macs)
+                reply(self.handleConnect(macs: macs))
+            }
+
+        case let s where s.hasPrefix("RELEASE "):
+            // The other Mac is rolling back a switch that only partly worked.
+            let macs = MAC.parseList(String(s.dropFirst("RELEASE ".count)))
+            guard switchLock.tryAcquire() else {
+                logger.warn("release from \(peerName) rejected: a switch is already running on this Mac")
+                reply("ERR busy")
+                return
+            }
+            logger.info("release requested by \(peerName): \(macs)")
+            workQueue.async { [weak self] in
+                guard let self = self else { return }
+                defer { self.switchLock.release() }
+                let reports = macs.map { mac -> PeripheralReport in
+                    let r = self.bluetooth.remove(mac)
+                    self.logger.info("  release \(mac): \(r)")
+                    return PeripheralReport(mac: mac, status: r.isFailure ? "failed" : "released",
+                                            error: r.isFailure ? "\(r)" : nil)
+                }
+                reply(PeripheralReport.encodeOK(reports))
             }
 
         default:
             logger.warn("rejected \(peerName): unknown command")
-            respond(conn: conn, "ERR bad_command\n")
+            reply("ERR bad_command")
         }
     }
 
@@ -376,7 +432,8 @@ final class NetworkServer: ObservableObject {
 
     // MARK: - Commands
 
-    private func handleConnect(conn: NWConnection, macs: [String]) {
+    /// Connects the peripherals here and returns the reply line.
+    private func handleConnect(macs: [String]) -> String {
         var reports: [PeripheralReport] = []
         for mac in macs {
             if bluetooth.isConnected(mac) {
@@ -405,7 +462,31 @@ final class NetworkServer: ObservableObject {
                                                 error: lastErr.map { "\($0)" } ?? "unknown"))
             }
         }
-        respond(conn: conn, PeripheralReport.encodeOK(reports) + "\n")
+        return PeripheralReport.encodeOK(settle(reports))
+    }
+
+    /// Some peripherals (notably the Magic Mouse) occasionally report
+    /// connected and drop a moment later. Re-check after a short pause and
+    /// retry any that fell off before answering.
+    private func settle(_ reports: [PeripheralReport]) -> [PeripheralReport] {
+        guard reports.contains(where: \.isConnected) else { return reports }
+        Thread.sleep(forTimeInterval: 1.5)
+        return reports.map { report in
+            guard report.isConnected, !bluetooth.isConnected(report.mac) else { return report }
+            logger.warn("  \(report.mac): dropped right after connecting; retrying")
+            for attempt in 1...2 {
+                if case .success = bluetooth.connect(report.mac) {
+                    Thread.sleep(forTimeInterval: 1)
+                    if bluetooth.isConnected(report.mac) {
+                        logger.info("  \(report.mac): reconnected and stayed (retry \(attempt))")
+                        return PeripheralReport(mac: report.mac, status: "connected",
+                                                attempts: (report.attempts ?? 1) + attempt)
+                    }
+                }
+            }
+            logger.warn("  \(report.mac): kept dropping")
+            return PeripheralReport(mac: report.mac, status: "failed", error: "connected but dropped straight away")
+        }
     }
 
     private func respond(conn: NWConnection, _ s: String) {

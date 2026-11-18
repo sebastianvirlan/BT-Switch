@@ -220,6 +220,10 @@ struct SettingsView: View {
 
             Divider().padding(.vertical, 2)
 
+            clipboardSettings
+
+            Divider().padding(.vertical, 2)
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("Listener Port").font(.headline)
                 HStack {
@@ -338,6 +342,22 @@ struct SettingsView: View {
         BTServices.shared.bluetooth.pairedDevices { list in
             devices = list
             settings.rememberNames(list)
+        }
+    }
+
+    // MARK: - Clipboard
+
+    private var clipboardSettings: some View {
+        let other = pairing.peer?.name ?? "the other Mac"
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Clipboard").font(.headline)
+            Toggle("Send copied text to \(other) when switching to it", isOn: $settings.sendClipboard)
+                .toggleStyle(.checkbox)
+            Toggle("Accept copied text from \(other)", isOn: $settings.acceptClipboard)
+                .toggleStyle(.checkbox)
+            Text("Text only, up to \(BTProtocol.maxClipboardBytes / 1024) KB, encrypted with the pairing key. Passwords copied from password managers are never sent. Both Macs must agree: one sends, the other accepts.")
+                .font(.caption).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
