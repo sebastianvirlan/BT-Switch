@@ -23,7 +23,7 @@ BTSwitch uses the same Bluetooth approach as Blue Switch (`IOBluetoothDevicePair
 - It pings the destination *before* removing peripherals locally, so a network failure can't leave you with no working keyboard.
 - A sleeping destination is woken fully before anything moves, and kept awake while it connects (see [The other Mac was asleep](#the-other-mac-was-asleep)).
 - If a peripheral doesn't arrive on the destination, BTSwitch reconnects it to the source Mac.
-- A peripheral that connected moments ago is given a few seconds to settle before it's unpaired, so a quick switch back doesn't leave the Magic Mouse stuck (see [The mouse stopped responding after switching back quickly](#the-mouse-stopped-responding-after-switching-back-quickly)).
+- A peripheral that connected moments ago is given a few seconds to settle before it's unpaired, and a few more to let go before another Mac connects it, so a quick switch back doesn't leave the Magic Mouse stuck (see [The mouse stopped responding after switching back quickly](#the-mouse-stopped-responding-after-switching-back-quickly)).
 - Only one switch runs at a time. If both Macs are clicked at once, both back off instead of fighting over the peripherals.
 - Connection attempts are retried up to 3 times, and `isConnected` is polled briefly afterwards because it can lag.
 
@@ -202,6 +202,8 @@ Occasionally a peripheral (most often the Magic Mouse) connects to the destinati
 Unpairing a peripheral tells it to forget the Mac (a "virtual cable unplug"). A Magic Mouse that gets this within about 6 seconds of connecting ignores it, keeps believing it's still paired with that Mac, and then ignores every other Mac until it's switched off and on. Neither Mac can fix that remotely; the destination's macOS log shows `Unplugging virtual cable … failed with status 118` on the Mac that let it go.
 
 So BTSwitch never unpairs a peripheral within 12 seconds of it connecting, whether BTSwitch connected it or it reconnected by itself. Switching straight back after a switch takes a few seconds longer ("letting peripherals settle…") instead of stranding the mouse.
+
+The same thing happens the other way round: a mouse that another Mac tries to connect within a second or two of being unpaired can wedge too (seen at 0.3s and 1.5s; fine from 2.2s). So after removing peripherals, the source waits 3 seconds before asking the destination to connect them, and again after taking them back from the destination.
 
 If the mouse is stuck anyway (for example the other Mac runs an older BTSwitch), switch it off and on and click the icon again.
 

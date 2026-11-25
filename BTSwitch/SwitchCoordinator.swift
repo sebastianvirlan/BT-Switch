@@ -214,6 +214,11 @@ final class SwitchCoordinator: ObservableObject {
                 logger.info("  remove \(mac): \(r)")
             }
         }
+        // A peripheral that's paged within a second or two of being told to
+        // forget this Mac can wedge until it's power-cycled (seen with the
+        // Magic Mouse at 0.3s and 1.5s; fine from 2.2s), so give it time
+        // to finish letting go before the destination reaches for it.
+        Thread.sleep(forTimeInterval: Self.letGoTime)
 
         // 3. Ask the destination to pair+connect. Up to 3 attempts per
         //    device of up to ~20s each, so allow plenty of time; the
@@ -297,6 +302,8 @@ final class SwitchCoordinator: ObservableObject {
         case .success(let resp): logger.info("RELEASE response: \(resp)")
         case .failure(let e): logger.warn("couldn't ask \(dest) to release \(label(macs)): \(e)")
         }
+        // Same as before CONNECT: let them finish forgetting the other Mac.
+        Thread.sleep(forTimeInterval: Self.letGoTime)
 
         // The peripherals may still be busy with the other Mac or dozing,
         // so keep trying for a while rather than once.
@@ -337,6 +344,9 @@ final class SwitchCoordinator: ObservableObject {
     static let wakeWait: TimeInterval = 15
     /// How long to keep trying to take peripherals back after a failure.
     static let reconnectWait: TimeInterval = 30
+    /// How long a peripheral needs after being unpaired before another Mac
+    /// can safely connect it.
+    static let letGoTime: TimeInterval = 3
 
     enum WatchedFailure: Error {
         case request(NetworkFailure)
