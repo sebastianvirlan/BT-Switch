@@ -196,7 +196,15 @@ final class SwitchCoordinator: ObservableObject {
             break
         }
 
-        // 2. Remove peripherals locally.
+        // 2. Remove peripherals locally. One that connected only seconds
+        //    ago can't take being unpaired yet (see settleTime), so give it
+        //    a moment rather than leave it stuck until it's power-cycled.
+        let settle = bluetooth.settleDelay(macs)
+        if settle > 0 {
+            logger.info("peripherals connected moments ago; waiting \(Int(settle.rounded(.up)))s before handing them over")
+            setStatus(.running("letting peripherals settle…"))
+            Thread.sleep(forTimeInterval: settle)
+        }
         setStatus(.running("removing locally…"))
         for mac in macs {
             let r = bluetooth.remove(mac)
@@ -320,7 +328,7 @@ final class SwitchCoordinator: ObservableObject {
         if stranded.isEmpty {
             fail("\(reason); kept everything on this Mac. Try again")
         } else {
-            fail("\(reason); couldn't reconnect \(label(stranded)) here. Wake it and click the icon again, or pair it in System Settings")
+            fail("\(reason); couldn't reconnect \(label(stranded)) here. Switch it off and on, then click the icon again")
         }
         return false
     }

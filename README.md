@@ -23,6 +23,7 @@ BTSwitch uses the same Bluetooth approach as Blue Switch (`IOBluetoothDevicePair
 - It pings the destination *before* removing peripherals locally, so a network failure can't leave you with no working keyboard.
 - A sleeping destination is woken fully before anything moves, and kept awake while it connects (see [The other Mac was asleep](#the-other-mac-was-asleep)).
 - If a peripheral doesn't arrive on the destination, BTSwitch reconnects it to the source Mac.
+- A peripheral that connected moments ago is given a few seconds to settle before it's unpaired, so a quick switch back doesn't leave the Magic Mouse stuck (see [The mouse stopped responding after switching back quickly](#the-mouse-stopped-responding-after-switching-back-quickly)).
 - Only one switch runs at a time. If both Macs are clicked at once, both back off instead of fighting over the peripherals.
 - Connection attempts are retried up to 3 times, and `isConnected` is polled briefly afterwards because it can lag.
 
@@ -195,6 +196,14 @@ Occasionally a peripheral (most often the Magic Mouse) connects to the destinati
 2. A peripheral only counts as arrived once it's both connected *and* paired; a connection without a completed pairing works until the device sleeps, then can't reconnect. The destination re-checks each peripheral shortly after connecting it and retries any that dropped or didn't finish pairing.
 3. If one still isn't there, the source asks the destination to try once more.
 4. If that fails too, BTSwitch keeps the set together: the destination releases what it got and everything reconnects to the source Mac, so you never end up with the keyboard on one Mac and the mouse on the other. Click the icon to try again.
+
+### The mouse stopped responding after switching back quickly
+
+Unpairing a peripheral tells it to forget the Mac (a "virtual cable unplug"). A Magic Mouse that gets this within about 6 seconds of connecting ignores it, keeps believing it's still paired with that Mac, and then ignores every other Mac until it's switched off and on. Neither Mac can fix that remotely; the destination's macOS log shows `Unplugging virtual cable … failed with status 118` on the Mac that let it go.
+
+So BTSwitch never unpairs a peripheral within 12 seconds of it connecting, whether BTSwitch connected it or it reconnected by itself. Switching straight back after a switch takes a few seconds longer ("letting peripherals settle…") instead of stranding the mouse.
+
+If the mouse is stuck anyway (for example the other Mac runs an older BTSwitch), switch it off and on and click the icon again.
 
 If a peripheral keeps dropping, restart Bluetooth on both Macs:
 

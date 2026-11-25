@@ -67,6 +67,38 @@ final class BluetoothController {
     private static let pairingWait: TimeInterval = 15
     private let queue = DispatchQueue(label: "\(AppInfo.bundleID).bluetooth", qos: .userInitiated)
 
+    /// How long a peripheral needs after connecting before it can be told
+    /// to forget this Mac. Unpairing sends the peripheral a "virtual cable
+    /// unplug"; a Magic Mouse that gets it within ~6s of connecting rejects
+    /// it (bluetoothd logs "Unplugging virtual cable … failed with status
+    /// 118"), keeps believing it's paired here, and then ignores every
+    /// other Mac until it's switched off and on. 10s was enough in testing;
+    /// allow some margin.
+    static let settleTime: TimeInterval = 12
+    private var linkUpAt: [String: Date] = [:]   // guarded by linkLock
+    private let linkLock = NSLock()
+    private var connectWatcher: ConnectWatcher?
+
+    /// Call once on main. Notes when peripherals connect by themselves
+    /// (after waking, or being switched off and on), not just through us.
+    func start() {
+        connectWatcher = ConnectWatcher { [weak self] mac in self?.markLinkUp(mac) }
+    }
+
+    private func markLinkUp(_ mac: String) {
+        linkLock.lock(); linkUpAt[mac] = Date(); linkLock.unlock()
+    }
+
+    /// Seconds to wait before `remove` can safely unpair these peripherals:
+    /// zero unless one of them connected less than `settleTime` ago.
+    func settleDelay(_ macs: [String]) -> TimeInterval {
+        linkLock.lock(); defer { linkLock.unlock() }
+        let now = Date()
+        return macs.compactMap { linkUpAt[MAC.normalize($0)] }
+            .map { Self.settleTime - now.timeIntervalSince($0) }
+            .max().map { max(0, $0) } ?? 0
+    }
+
     // MARK: - Reads
 
     /// Connected *and* paired. A device connected without a completed
@@ -172,13 +204,19 @@ final class BluetoothController {
     /// Pair-and-connect. Synchronous.
     func connect(_ mac: String) -> Result<Void, ConnectError> {
         dispatchPrecondition(condition: .notOnQueue(queue))
-        return queue.sync { self.doConnect(mac) }
+        let r = queue.sync { self.doConnect(mac) }
+        if case .success = r { markLinkUp(MAC.normalize(mac)) }
+        return r
     }
 
     /// Hard unregister via the private "remove" selector, then confirm the
     /// device is really gone. Synchronous.
+    /// Waits out `settleDelay` first, so a peripheral that only just
+    /// connected isn't left stuck believing it's still paired here.
     func remove(_ mac: String) -> RemoveResult {
         dispatchPrecondition(condition: .notOnQueue(queue))
+        let wait = settleDelay([mac])
+        if wait > 0 { Thread.sleep(forTimeInterval: wait) }
         return queue.sync {
             guard let device = Self.device(mac) else { return .deviceNotFound }
             if !device.isPaired() {
@@ -279,6 +317,27 @@ final class BluetoothController {
             }
             return .failure(.notConnectedAfterOpen(mac))
         }
+    }
+}
+
+/// Reports every Bluetooth device that connects to this Mac, from whatever
+/// cause. Callbacks arrive on main.
+private final class ConnectWatcher: NSObject {
+    private let onConnect: (String) -> Void
+    private var registration: IOBluetoothUserNotification?
+
+    init(onConnect: @escaping (String) -> Void) {
+        self.onConnect = onConnect
+        super.init()
+        registration = IOBluetoothDevice.register(
+            forConnectNotifications: self, selector: #selector(connected(_:device:)))
+    }
+
+    deinit { registration?.unregister() }
+
+    @objc private func connected(_ note: IOBluetoothUserNotification?, device: IOBluetoothDevice?) {
+        guard let addr = device?.addressString else { return }
+        onConnect(MAC.normalize(addr))
     }
 }
 

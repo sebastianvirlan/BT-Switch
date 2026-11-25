@@ -394,6 +394,10 @@ final class NetworkServer: ObservableObject {
             workQueue.async { [weak self] in
                 guard let self = self else { return }
                 defer { self.switchLock.release() }
+                let settle = self.bluetooth.settleDelay(macs)
+                if settle > 0 {
+                    self.logger.info("  waiting \(Int(settle.rounded(.up)))s for peripherals that just connected to settle")
+                }
                 let reports = macs.map { mac -> PeripheralReport in
                     let r = self.bluetooth.remove(mac)
                     self.logger.info("  release \(mac): \(r)")

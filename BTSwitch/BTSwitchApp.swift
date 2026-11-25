@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             PairingPrompt.show(request, decide: decide)
         }
         services.power.start()
+        services.bluetooth.start()
         services.server.start()
         services.directory.start()
 
