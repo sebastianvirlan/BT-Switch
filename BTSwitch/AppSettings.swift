@@ -63,6 +63,11 @@ final class AppSettings: ObservableObject {
         didSet { UserDefaults.standard.set(peripheralNames, forKey: Keys.peripheralNames) }
     }
 
+    /// The stored names, readable from any thread.
+    static var storedPeripheralNames: [String: String] {
+        (UserDefaults.standard.dictionary(forKey: Keys.peripheralNames) as? [String: String]) ?? [:]
+    }
+
     /// Send this Mac's clipboard text to the other Mac when switching away.
     @Published var sendClipboard: Bool {
         didSet { UserDefaults.standard.set(sendClipboard, forKey: Keys.sendClipboard) }

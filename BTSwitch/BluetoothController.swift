@@ -40,6 +40,7 @@ final class BluetoothController {
 
     enum RemoveResult: Equatable, CustomStringConvertible {
         case removed
+        case disconnected       // wasn't paired, but held a half-made link; closed it
         case notPaired          // nothing to do
         case stillPaired        // `remove` ran but the device is still paired
         case unsupported        // private selector missing (macOS changed)
@@ -48,6 +49,7 @@ final class BluetoothController {
         var description: String {
             switch self {
             case .removed: return "removed"
+            case .disconnected: return "dropped a half-made connection"
             case .notPaired: return "not paired (no-op)"
             case .stillPaired: return "remove had no effect; device still paired"
             case .unsupported: return "remove API unavailable on this macOS version"
@@ -59,6 +61,10 @@ final class BluetoothController {
     }
 
     private static let invalidRSSI: Int8 = 127
+    /// How long to wait for the link to come up after openConnection.
+    private static let connectWait: TimeInterval = 5
+    /// How long to wait for pairing to finish once the link is up.
+    private static let pairingWait: TimeInterval = 15
     private let queue = DispatchQueue(label: "\(AppInfo.bundleID).bluetooth", qos: .userInitiated)
 
     // MARK: - Reads
@@ -94,6 +100,25 @@ final class BluetoothController {
         }
     }
 
+    /// Orders peripherals keyboard, trackpad, other, mouse: the mouse is the
+    /// slowest and least reliable to pair, so it shouldn't hold the others up.
+    /// macOS can forget a removed device's name, so `names` (what BTSwitch
+    /// remembered from the picker) is the fallback.
+    func sortedForConnecting(_ macs: [String], names: [String: String] = [:]) -> [String] {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        let ranks: [String: Int] = queue.sync {
+            Dictionary(macs.map { mac -> (String, Int) in
+                let d = Self.device(mac)
+                let name = d?.name ?? names[mac] ?? ""
+                let kind = d.map { Self.kind(of: $0, name: name) } ?? Self.kind(name: name)
+                return (mac, kind.connectOrder)
+            }, uniquingKeysWith: { a, _ in a })
+        }
+        return macs.enumerated()
+            .sorted { (ranks[$0.element] ?? 2, $0.offset) < (ranks[$1.element] ?? 2, $1.offset) }
+            .map(\.element)
+    }
+
     struct PairedDevice: Identifiable, Equatable {
         enum Kind { case keyboard, mouse, trackpad, other }
         let address: String     // normalised, e.g. "10:94:bb:b9:73:74"
@@ -118,6 +143,14 @@ final class BluetoothController {
                 .sorted { ($0.kind.sortOrder, $0.name) < ($1.kind.sortOrder, $1.name) }
             DispatchQueue.main.async { completion(devices) }
         }
+    }
+
+    private static func kind(name: String) -> PairedDevice.Kind {
+        let lower = name.lowercased()
+        if lower.contains("trackpad") { return .trackpad }
+        if lower.contains("keyboard") { return .keyboard }
+        if lower.contains("mouse") { return .mouse }
+        return .other
     }
 
     private static func kind(of d: IOBluetoothDevice, name: String) -> PairedDevice.Kind {
@@ -148,7 +181,15 @@ final class BluetoothController {
         dispatchPrecondition(condition: .notOnQueue(queue))
         return queue.sync {
             guard let device = Self.device(mac) else { return .deviceNotFound }
-            if !device.isPaired() { return .notPaired }
+            if !device.isPaired() {
+                // Connected without a finished pairing still holds the
+                // peripheral's link, so the other Mac can't take it. Let go.
+                if device.isConnected() {
+                    device.closeConnection()
+                    return .disconnected
+                }
+                return .notPaired
+            }
             let sel = NSSelectorFromString("remove")
             guard device.responds(to: sel) else { return .unsupported }
             _ = device.perform(sel)
@@ -212,15 +253,31 @@ final class BluetoothController {
                 return .failure(.openConnectionFailed(mac, openRC))
             }
 
-            // isConnected / isPaired can lag a bit. Poll until both are
-            // true: connected-but-unpaired looks fine now but the device
-            // won't reconnect after it sleeps.
-            let deadline = Date().addingTimeInterval(5)
-            while Date() < deadline {
-                if device.isConnected() && device.isPaired() { return .success(()) }
+            // isConnected / isPaired can lag. Poll until both are true:
+            // connected-but-unpaired looks fine now but the device won't
+            // reconnect after it sleeps. The Magic Mouse in particular can
+            // take well over 5s to finish pairing once connected, and
+            // giving up early tears down a pairing that was about to work,
+            // so allow longer while the link is up.
+            let started = Date()
+            var sawConnected = false
+            while Date().timeIntervalSince(started) < Self.pairingWait {
+                let connected = device.isConnected()
+                if connected && device.isPaired() { return .success(()) }
+                if connected {
+                    sawConnected = true
+                } else if sawConnected || Date().timeIntervalSince(started) > Self.connectWait {
+                    break   // dropped, or never came up
+                }
                 Thread.sleep(forTimeInterval: 0.2)
             }
-            return .failure(device.isConnected() ? .connectedButNotPaired(mac) : .notConnectedAfterOpen(mac))
+            if device.isConnected() {
+                // Don't hold on to a link that never finished pairing: it
+                // keeps the peripheral from going anywhere else.
+                device.closeConnection()
+                return .failure(.connectedButNotPaired(mac))
+            }
+            return .failure(.notConnectedAfterOpen(mac))
         }
     }
 }
@@ -245,6 +302,15 @@ extension BluetoothController.PairedDevice.Kind {
         case .mouse: return 1
         case .trackpad: return 2
         case .other: return 3
+        }
+    }
+
+    var connectOrder: Int {
+        switch self {
+        case .keyboard: return 0
+        case .trackpad: return 1
+        case .other: return 2
+        case .mouse: return 3
         }
     }
 

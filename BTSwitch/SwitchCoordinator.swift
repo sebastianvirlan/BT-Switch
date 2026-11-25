@@ -208,12 +208,13 @@ final class SwitchCoordinator: ObservableObject {
         }
 
         // 3. Ask the destination to pair+connect. Up to 3 attempts per
-        //    device with several seconds each, so allow plenty of time.
+        //    device of up to ~20s each, so allow plenty of time; the
+        //    check-ins catch a destination that has gone away.
         setStatus(.running("connecting on \(dest)…"))
         var connectReports: [PeripheralReport]?
         var connectProblem: String?
         var destWentQuiet = false
-        switch sendWatched("CONNECT \(macList)", timeout: 90) {
+        switch sendWatched("CONNECT \(macList)", timeout: 130) {
         case .failure(.stoppedAnswering):
             logger.error("\(dest) stopped answering during CONNECT (asleep?)")
             connectProblem = "\(dest) stopped answering (did it go to sleep?)"
@@ -257,7 +258,7 @@ final class SwitchCoordinator: ObservableObject {
         if !missing.isEmpty, connectReports != nil {
             logger.warn("not on \(dest) yet: \(label(missing)); asking it to try again")
             setStatus(.running("retrying \(label(missing)) on \(dest)…"))
-            switch sendWatched("CONNECT \(missing.joined(separator: ","))", timeout: 60) {
+            switch sendWatched("CONNECT \(missing.joined(separator: ","))", timeout: 130) {
             case .success(let resp): logger.info("retry CONNECT response: \(resp)")
             case .failure(.stoppedAnswering):
                 logger.error("\(dest) stopped answering during the retry (asleep?)")
@@ -279,23 +280,24 @@ final class SwitchCoordinator: ObservableObject {
         //    got and bring everything back here.
         let reason = connectProblem ?? "\(label(missing)) didn't connect on \(dest)"
         logger.warn("\(reason); bringing all peripherals back to this Mac")
-        // If it went quiet we don't know what it got, so ask it to release
-        // everything; if it's asleep, it drops stale work when it wakes.
-        let toRelease = destWentQuiet ? macs : macs.filter { arrived.contains($0) }
-        if !toRelease.isEmpty {
-            setStatus(.running("taking peripherals back from \(dest)…"))
-            switch send("RELEASE \(toRelease.joined(separator: ","))", timeout: destWentQuiet ? 5 : 20) {
-            case .success(let resp): logger.info("RELEASE response: \(resp)")
-            case .failure(let e): logger.warn("couldn't ask \(dest) to release \(label(toRelease)): \(e)")
-            }
+        // Release everything, not just what arrived: a peripheral that
+        // connected without pairing still holds a link there, and we can't
+        // reconnect it here until that's dropped. If the destination went
+        // quiet, it drops stale work when it wakes.
+        setStatus(.running("taking peripherals back from \(dest)…"))
+        switch send("RELEASE \(macList)", timeout: destWentQuiet ? 5 : 20) {
+        case .success(let resp): logger.info("RELEASE response: \(resp)")
+        case .failure(let e): logger.warn("couldn't ask \(dest) to release \(label(macs)): \(e)")
         }
 
         // The peripherals may still be busy with the other Mac or dozing,
         // so keep trying for a while rather than once.
         setStatus(.running("reconnecting here…"))
-        var stranded = macs.filter { !bluetooth.isReady($0) }
+        var stranded = bluetooth.sortedForConnecting(macs, names: names).filter { !bluetooth.isReady($0) }
         let reconnectDeadline = Date().addingTimeInterval(Self.reconnectWait)
         var round = 0
+        // A single openConnection can block ~20s, so always allow a second
+        // try, by which time the other Mac has usually let go.
         while !stranded.isEmpty {
             round += 1
             stranded = stranded.filter { mac in
@@ -308,7 +310,7 @@ final class SwitchCoordinator: ObservableObject {
                     return true
                 }
             }
-            if stranded.isEmpty || Date() >= reconnectDeadline { break }
+            if stranded.isEmpty || (round >= 2 && Date() >= reconnectDeadline) { break }
             Thread.sleep(forTimeInterval: 2)
         }
         for mac in stranded {
@@ -326,7 +328,7 @@ final class SwitchCoordinator: ObservableObject {
     /// How long to wait for a sleeping destination to wake fully.
     static let wakeWait: TimeInterval = 15
     /// How long to keep trying to take peripherals back after a failure.
-    static let reconnectWait: TimeInterval = 20
+    static let reconnectWait: TimeInterval = 30
 
     enum WatchedFailure: Error {
         case request(NetworkFailure)

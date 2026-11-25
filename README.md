@@ -189,11 +189,12 @@ If this Mac isn't paired yet or has no peripherals configured, left-click opens 
 
 ### A peripheral connects, then drops
 
-Occasionally a peripheral (most often the Magic Mouse) connects to the destination and drops a moment later. BTSwitch handles this in three steps:
+Occasionally a peripheral (most often the Magic Mouse) connects to the destination and drops a moment later. BTSwitch handles this in four steps:
 
-1. A peripheral only counts as arrived once it's both connected *and* paired; a connection without a completed pairing works until the device sleeps, then can't reconnect. The destination re-checks each peripheral shortly after connecting it and retries any that dropped or didn't finish pairing.
-2. If one still isn't there, the source asks the destination to try once more.
-3. If that fails too, BTSwitch keeps the set together: the destination releases what it got and everything reconnects to the source Mac, so you never end up with the keyboard on one Mac and the mouse on the other. Click the icon to try again.
+1. Keyboards connect first and the mouse last, and every peripheral gets one attempt before any gets a retry, so a slow mouse never holds up the keyboard. Pairing gets up to 15 seconds once the link is up, because the Magic Mouse can be slow, and a pairing that finishes just after that is kept rather than restarted.
+2. A peripheral only counts as arrived once it's both connected *and* paired; a connection without a completed pairing works until the device sleeps, then can't reconnect. The destination re-checks each peripheral shortly after connecting it and retries any that dropped or didn't finish pairing.
+3. If one still isn't there, the source asks the destination to try once more.
+4. If that fails too, BTSwitch keeps the set together: the destination releases what it got and everything reconnects to the source Mac, so you never end up with the keyboard on one Mac and the mouse on the other. Click the icon to try again.
 
 If a peripheral keeps dropping, restart Bluetooth on both Macs:
 

@@ -44,7 +44,7 @@ final class NetworkServer: ObservableObject {
     static let approvalTimeout: TimeInterval = 60
     /// A CONNECT still running after this long is abandoned; the other Mac
     /// gives up on it soon after.
-    static let connectBudget: TimeInterval = 75
+    static let connectBudget: TimeInterval = 110
 
     init(settings: AppSettings, bluetooth: BluetoothController, logger: AppLogger,
          switchLock: SwitchLock, pairing: PairingStore, power: PowerMonitor) {
@@ -520,37 +520,56 @@ final class NetworkServer: ObservableObject {
     }
 
     /// Connects the peripherals here and returns the reply line.
+    ///
+    /// Each device gets one attempt before any device gets a retry, so one
+    /// slow peripheral (usually the mouse) doesn't keep the others waiting.
     private func handleConnect(macs: [String], job: ConnectJob) -> String {
-        var reports: [PeripheralReport] = []
-        for mac in macs {
-            if staleReason(job) != nil { break }
+        var done: [String: PeripheralReport] = [:]
+        var lastErr: [String: BluetoothController.ConnectError] = [:]
+        var pending: [String] = []
+        // Keyboards first, mice last: the mouse is the one that tends to be
+        // slow, and you can do a lot more with just a keyboard meanwhile.
+        for mac in bluetooth.sortedForConnecting(macs, names: AppSettings.storedPeripheralNames) {
             if bluetooth.isReady(mac) {
                 logger.info("  \(mac): already connected")
-                reports.append(PeripheralReport(mac: mac, status: "already_connected"))
-                continue
+                done[mac] = PeripheralReport(mac: mac, status: "already_connected")
+            } else {
+                pending.append(mac)
             }
-            var lastErr: BluetoothController.ConnectError?
-            var connectedOnAttempt: Int?
-            for attempt in 1...3 {
-                if staleReason(job) != nil { break }
+        }
+
+        for attempt in 1...3 where !pending.isEmpty {
+            if attempt > 1 { Thread.sleep(forTimeInterval: 2) }
+            var stillPending: [String] = []
+            for mac in pending {
+                if staleReason(job) != nil {
+                    stillPending.append(mac)
+                    continue
+                }
+                // Pairing sometimes finishes just after we stopped waiting;
+                // don't tear that down by starting over.
+                if attempt > 1, bluetooth.isReady(mac) {
+                    logger.info("  \(mac): finished pairing late; connected")
+                    done[mac] = PeripheralReport(mac: mac, status: "connected", attempts: attempt - 1)
+                    continue
+                }
                 switch bluetooth.connect(mac) {
                 case .success:
                     logger.info("  \(mac): connected (attempt \(attempt))")
-                    connectedOnAttempt = attempt
+                    done[mac] = PeripheralReport(mac: mac, status: "connected", attempts: attempt)
                 case .failure(let e):
-                    lastErr = e
+                    lastErr[mac] = e
                     logger.warn("  \(mac): attempt \(attempt) failed - \(e)")
-                    if attempt < 3 { Thread.sleep(forTimeInterval: 2) }
+                    stillPending.append(mac)
                 }
-                if connectedOnAttempt != nil { break }
             }
-            if let attempt = connectedOnAttempt {
-                reports.append(PeripheralReport(mac: mac, status: "connected", attempts: attempt))
-            } else {
-                reports.append(PeripheralReport(mac: mac, status: "failed",
-                                                error: lastErr.map { "\($0)" } ?? "unknown"))
-            }
+            pending = stillPending
         }
+        for mac in pending {
+            done[mac] = PeripheralReport(mac: mac, status: "failed",
+                                         error: lastErr[mac].map { "\($0)" } ?? "unknown")
+        }
+        var reports = macs.compactMap { done[$0] }
         if staleReason(job) == nil { reports = settle(reports, job: job) }
         if let why = staleReason(job) { return abandon(macs: macs, reports: reports, because: why) }
         return PeripheralReport.encodeOK(reports)
@@ -580,7 +599,10 @@ final class NetworkServer: ObservableObject {
             guard report.isConnected, !bluetooth.isReady(report.mac) else { return report }
             logger.warn("  \(report.mac): dropped or didn't finish pairing; retrying")
             for attempt in 1...2 where staleReason(job) == nil {
-                if case .success = bluetooth.connect(report.mac) {
+                // It may have finished pairing late; only start over if not.
+                var up = bluetooth.isReady(report.mac)
+                if !up, case .success = bluetooth.connect(report.mac) { up = true }
+                if up {
                     Thread.sleep(forTimeInterval: 1)
                     if bluetooth.isReady(report.mac) {
                         logger.info("  \(report.mac): reconnected and stayed (retry \(attempt))")
